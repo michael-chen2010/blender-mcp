@@ -37,8 +37,11 @@ from .blender_runtime import (
     resolve_blender_runtime,
 )
 from .asset_pipeline import (
+    AssetBatchError,
+    AssetPipelineManager,
     AssetPrepareError,
     asset_worker_slot,
+    discover_blend_files as discover_local_blend_files,
     get_prepared_artifact_store,
     prepare_blend_file,
     render_supplemental_view,
@@ -62,6 +65,8 @@ _prepared_observation_service: PreparedObservationService | None = None
 _prepared_observation_service_lock = threading.Lock()
 _prepared_artifact_transfer_service: PreparedArtifactTransferService | None = None
 _prepared_artifact_transfer_service_lock = threading.Lock()
+_asset_pipeline_manager: AssetPipelineManager | None = None
+_asset_pipeline_manager_lock = threading.Lock()
 
 @dataclass
 class BlenderConnection:
@@ -263,6 +268,11 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
             recorder.flush(2.0)
         except Exception as e:
             logger.debug(f"Episode close on shutdown skipped: {e}")
+        if _asset_pipeline_manager is not None:
+            try:
+                await _asset_pipeline_manager.shutdown()
+            except Exception as e:
+                logger.debug(f"Asset pipeline shutdown cleanup skipped: {e}")
         # Clean up the global connection on shutdown
         global _blender_connection
         if _blender_connection:
@@ -497,6 +507,20 @@ def get_prepared_observation_service() -> PreparedObservationService:
     return _prepared_observation_service
 
 
+def get_asset_pipeline_manager() -> AssetPipelineManager:
+    """Return the process-wide batch prepare registry and scheduler."""
+
+    global _asset_pipeline_manager
+    if _asset_pipeline_manager is None:
+        with _asset_pipeline_manager_lock:
+            if _asset_pipeline_manager is None:
+                _asset_pipeline_manager = AssetPipelineManager(
+                    artifact_store=get_prepared_artifact_store(),
+                    runtime_provider=_resolve_server_asset_runtime,
+                )
+    return _asset_pipeline_manager
+
+
 def get_prepared_artifact_transfer_service() -> PreparedArtifactTransferService:
     """Return the process-wide prepared artifact transfer service used across MCP calls."""
 
@@ -505,7 +529,8 @@ def get_prepared_artifact_transfer_service() -> PreparedArtifactTransferService:
         with _prepared_artifact_transfer_service_lock:
             if _prepared_artifact_transfer_service is None:
                 _prepared_artifact_transfer_service = PreparedArtifactTransferService(
-                    get_prepared_artifact_store()
+                    get_prepared_artifact_store(),
+                    prepare_manifest_resolver=get_asset_pipeline_manager().resolve_upload_manifest,
                 )
     return _prepared_artifact_transfer_service
 
@@ -755,6 +780,173 @@ async def prepare_blend_asset(
     except Exception as exc:
         logger.exception("prepare_blend_asset failed")
         return _stable_prepare_error(exc, "BLENDER_PREPARE_FAILED")
+
+
+def _batch_prepare_page_content(page: Dict[str, Any]) -> CallToolResult:
+    """Convert an internal batch page into path-free structured data plus preview images."""
+
+    store = get_prepared_artifact_store()
+    public_page: Dict[str, Any] = {
+        "batchPrepareId": page.get("batchPrepareId"),
+        "status": page.get("status"),
+        "counts": page.get("counts", {}),
+        "items": [],
+        "nextCursor": page.get("nextCursor"),
+    }
+    content = [
+        TextContent(
+            type="text",
+            text=f"Batch prepare {page.get('batchPrepareId')} is {page.get('status')}.",
+        )
+    ]
+    raw_items = page.get("items") if isinstance(page.get("items"), list) else []
+    for raw_item in raw_items:
+        if not isinstance(raw_item, dict):
+            continue
+        public_item: Dict[str, Any] = {
+            key: raw_item[key]
+            for key in ("itemKey", "sourceDisplayName", "sourceFingerprint", "status", "attempts", "error")
+            if key in raw_item
+        }
+        raw_result = raw_item.get("result")
+        preview_path = None
+        if isinstance(raw_result, dict):
+            public_result: Dict[str, Any] = {
+                key: raw_result[key]
+                for key in ("prepareId", "profile", "observation", "warnings", "timings", "validation")
+                if key in raw_result
+            }
+            public_artifacts = []
+            raw_artifacts = raw_result.get("artifacts")
+            if isinstance(raw_artifacts, list):
+                for raw_artifact in raw_artifacts:
+                    if not isinstance(raw_artifact, dict):
+                        continue
+                    artifact_id = raw_artifact.get("artifact_id") or raw_artifact.get("artifactId")
+                    kind = raw_artifact.get("kind")
+                    if not isinstance(artifact_id, str) or not isinstance(kind, str):
+                        continue
+                    path = store.resolve(artifact_id)
+                    public_artifacts.append(
+                        {
+                            "artifactId": artifact_id,
+                            "kind": kind,
+                            "fileName": path.name,
+                            "size": raw_artifact.get("size"),
+                            "sha256": raw_artifact.get("sha256"),
+                            "mimeType": raw_artifact.get("content_type") or raw_artifact.get("mimeType"),
+                            "expiresAt": raw_artifact.get("expires_at") or raw_artifact.get("expiresAt"),
+                        }
+                    )
+                    if kind == "PREVIEW" and preview_path is None:
+                        preview_path = path
+            public_result["artifacts"] = public_artifacts
+            public_item["result"] = public_result
+        public_page["items"].append(public_item)
+        if public_item.get("status") == "READY" and preview_path is not None:
+            label = f"{public_item.get('itemKey')} — {public_item.get('sourceDisplayName')}"
+            content.append(TextContent(type="text", text=label))
+            content.append(Image(path=preview_path, format="png").to_image_content())
+    return CallToolResult(content=content, structuredContent=public_page, isError=False)
+
+
+@mcp.tool()
+def discover_blend_files(directory: str) -> CallToolResult:
+    """Discover local .blend files and return a deterministic fingerprinted manifest."""
+
+    try:
+        items = discover_local_blend_files(directory)
+        return CallToolResult(
+            content=[TextContent(type="text", text=f"Discovered {len(items)} Blender file(s).")],
+            structuredContent={"itemCount": len(items), "items": items},
+            isError=False,
+        )
+    except AssetBatchError as exc:
+        return _prepare_blend_asset_error(exc.code, exc.message)
+    except Exception:
+        logger.error("discover_blend_files failed with an internal error")
+        return _prepare_blend_asset_error("BLEND_DISCOVERY_FAILED", "Blend file discovery failed")
+
+
+@mcp.tool()
+async def start_prepare_blend_assets(
+    items: List[Dict[str, Any]],
+    profile: str,
+    idempotency_key: str,
+    batch_prepare_id: str | None = None,
+    concurrency: int | None = None,
+    overrides: Dict[str, Any] | None = None,
+) -> CallToolResult:
+    """Start or retry an asynchronous local batch prepare job."""
+
+    try:
+        _validate_prepare_overrides(overrides)
+        result = await get_asset_pipeline_manager().start_prepare_blend_assets(
+            items,
+            profile,
+            idempotency_key,
+            batch_prepare_id=batch_prepare_id,
+            concurrency=concurrency,
+        )
+        return CallToolResult(
+            content=[
+                TextContent(
+                    type="text",
+                    text=f"Batch prepare {result['batchPrepareId']} is {result['status']}.",
+                )
+            ],
+            structuredContent=result,
+            isError=False,
+        )
+    except _PrepareBlendAssetInputError as exc:
+        return _prepare_blend_asset_error(exc.code, exc.message)
+    except AssetBatchError as exc:
+        return _prepare_blend_asset_error(exc.code, exc.message)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.error("start_prepare_blend_assets failed with an internal error")
+        return _prepare_blend_asset_error("BATCH_PREPARE_FAILED", "Batch prepare job could not be started")
+
+
+@mcp.tool()
+def get_prepare_blend_assets(
+    batch_prepare_id: str,
+    cursor: str | None = None,
+    limit: int = 50,
+) -> CallToolResult:
+    """Return one bounded batch page with adjacent item labels and MAIN previews."""
+
+    try:
+        page = get_asset_pipeline_manager().get_prepare_blend_assets(
+            batch_prepare_id,
+            cursor=cursor,
+            limit=limit,
+        )
+        return _batch_prepare_page_content(page)
+    except AssetBatchError as exc:
+        return _prepare_blend_asset_error(exc.code, exc.message)
+    except PreparedArtifactError as exc:
+        return _prepare_blend_asset_error(exc.code, str(exc).partition(":")[2].strip() or str(exc))
+    except Exception:
+        logger.error("get_prepare_blend_assets failed with an internal error")
+        return _prepare_blend_asset_error("BATCH_PREPARE_FAILED", "Batch prepare job lookup failed")
+
+
+@mcp.tool()
+async def cancel_prepare_blend_assets(batch_prepare_id: str) -> CallToolResult:
+    """Cancel queued/running local workers while retaining already READY items."""
+
+    try:
+        page = await get_asset_pipeline_manager().cancel_prepare_blend_assets(batch_prepare_id)
+        return _batch_prepare_page_content(page)
+    except AssetBatchError as exc:
+        return _prepare_blend_asset_error(exc.code, exc.message)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.error("cancel_prepare_blend_assets failed with an internal error")
+        return _prepare_blend_asset_error("BATCH_PREPARE_FAILED", "Batch prepare cancellation failed")
 
 
 @mcp.tool()

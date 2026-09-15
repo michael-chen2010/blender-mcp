@@ -11,7 +11,7 @@ from pathlib import Path
 import secrets
 import threading
 import time
-from typing import Any, AsyncIterator, Mapping
+from typing import Any, AsyncIterator, Callable, Mapping
 from urllib.parse import urlsplit
 
 import httpx
@@ -190,6 +190,7 @@ class PreparedArtifactTransferService:
         *,
         chunk_size: int = _DEFAULT_CHUNK_SIZE,
         page_size: int = _DEFAULT_PAGE_SIZE,
+        prepare_manifest_resolver: Callable[[str], Mapping[str, set[str]] | None] | None = None,
     ):
         if chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
@@ -198,6 +199,7 @@ class PreparedArtifactTransferService:
         self._artifact_store = artifact_store
         self._chunk_size = int(chunk_size)
         self._page_size = int(page_size)
+        self._prepare_manifest_resolver = prepare_manifest_resolver
         self._jobs: dict[str, _UploadJob] = {}
         self._lock = threading.RLock()
 
@@ -343,6 +345,27 @@ class PreparedArtifactTransferService:
 
     def _validate_artifact_handle(self, artifact_id: str) -> None:
         self._artifact_prepare_id(artifact_id)
+
+    def _validate_batch_prepare_membership(
+        self,
+        batch_prepare_id: str,
+        items: list[dict[str, Any]],
+    ) -> None:
+        if self._prepare_manifest_resolver is None:
+            return
+        manifest = self._prepare_manifest_resolver(batch_prepare_id)
+        if manifest is None:
+            raise FileTransferError(
+                "UPLOAD_BATCH_PREPARE_NOT_FOUND",
+                "Unknown batch_prepare_id for prepared artifact upload",
+            )
+        for item in items:
+            artifact_ids = manifest.get(item["itemKey"])
+            if artifact_ids is None or item["artifactId"] not in artifact_ids:
+                raise FileTransferError(
+                    "UPLOAD_ARTIFACT_NOT_IN_BATCH_PREPARE",
+                    "upload item/artifact does not belong to the batch prepare manifest",
+                )
 
     def _normalize_concurrency(self, concurrency: int | None) -> int:
         if concurrency is None:
@@ -491,6 +514,7 @@ class PreparedArtifactTransferService:
         fingerprint = _request_fingerprint(batch_prepare_id, normalized_items)
 
         if upload_id is None:
+            self._validate_batch_prepare_membership(batch_prepare_id, normalized_items)
             for artifact_id in artifact_ids:
                 self._validate_artifact_handle(artifact_id)
             job = _UploadJob(
