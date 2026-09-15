@@ -1,5 +1,6 @@
 # blender_mcp_server.py
 from mcp.server.fastmcp import FastMCP, Context, Image
+from mcp.types import CallToolResult, TextContent
 import socket
 import json
 import asyncio
@@ -34,6 +35,11 @@ from .blender_runtime import (
     configured_asset_concurrency,
     recommended_asset_concurrency,
     resolve_blender_runtime,
+)
+from .asset_pipeline import (
+    AssetPrepareError,
+    get_prepared_artifact_store,
+    prepare_blend_file,
 )
 
 # Configure logging
@@ -429,6 +435,277 @@ def get_asset_pipeline_status() -> str:
         },
         indent=2,
     )
+
+
+class _PrepareBlendAssetInputError(ValueError):
+    def __init__(self, code: str, message: str):
+        self.code = code
+        self.message = message
+        super().__init__(f"{code}: {message}")
+
+
+def _prepare_blend_asset_error(code: str, message: str) -> CallToolResult:
+    text = f"{code}: {message}"
+    return CallToolResult(
+        content=[TextContent(type="text", text=text)],
+        structuredContent={"error": {"code": code, "message": message}},
+        isError=True,
+    )
+
+
+def _stable_prepare_error(exc: Exception, default_code: str) -> CallToolResult:
+    message = str(exc)
+    prefix, separator, detail = message.partition(":")
+    if (
+        separator
+        and prefix
+        and prefix == prefix.upper()
+        and all(char.isalnum() or char == "_" for char in prefix)
+    ):
+        return _prepare_blend_asset_error(prefix, detail.strip() or message)
+    return _prepare_blend_asset_error(default_code, message)
+
+
+def _validate_prepare_source(source: Dict[str, Any]) -> tuple[str, Path | None]:
+    if not isinstance(source, dict):
+        raise _PrepareBlendAssetInputError(
+            "PREPARE_INVALID_SOURCE", "source must be an object"
+        )
+
+    kind = source.get("kind")
+    if kind == "BLEND_FILE":
+        if set(source) - {"kind", "path"}:
+            raise _PrepareBlendAssetInputError(
+                "PREPARE_INVALID_SOURCE", "BLEND_FILE source contains unsupported fields"
+            )
+        raw_path = source.get("path")
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            raise _PrepareBlendAssetInputError(
+                "PREPARE_INVALID_SOURCE", "BLEND_FILE source.path is required"
+            )
+        path = Path(raw_path)
+        if path.suffix.lower() != ".blend":
+            raise _PrepareBlendAssetInputError(
+                "PREPARE_INVALID_SOURCE", "BLEND_FILE source.path must end with .blend"
+            )
+        if not path.is_file():
+            raise _PrepareBlendAssetInputError(
+                "BLEND_SOURCE_NOT_FOUND", f"Blend source does not exist: {path}"
+            )
+        return kind, path
+
+    if kind == "CURRENT_SELECTION":
+        if set(source) != {"kind"}:
+            raise _PrepareBlendAssetInputError(
+                "PREPARE_INVALID_SOURCE", "CURRENT_SELECTION accepts only the kind field"
+            )
+        return kind, None
+
+    raise _PrepareBlendAssetInputError(
+        "PREPARE_INVALID_SOURCE",
+        "source.kind must be BLEND_FILE or CURRENT_SELECTION",
+    )
+
+
+def _validate_prepare_overrides(overrides: Dict[str, Any] | None) -> None:
+    if overrides is None or overrides == {}:
+        return
+    if not isinstance(overrides, dict):
+        raise _PrepareBlendAssetInputError(
+            "PREPARE_INVALID_OVERRIDES", "overrides must be an object"
+        )
+
+    allowed = {"preview", "includeAnimationDetails", "preparePayload", "runValidation"}
+    unknown = set(overrides) - allowed
+    if unknown:
+        raise _PrepareBlendAssetInputError(
+            "PREPARE_INVALID_OVERRIDES",
+            f"unsupported override field(s): {', '.join(sorted(unknown))}",
+        )
+
+    for key in ("includeAnimationDetails", "preparePayload", "runValidation"):
+        if key in overrides and not isinstance(overrides[key], bool):
+            raise _PrepareBlendAssetInputError(
+                "PREPARE_INVALID_OVERRIDES", f"overrides.{key} must be boolean"
+            )
+
+    preview = overrides.get("preview")
+    if preview is not None:
+        if not isinstance(preview, dict):
+            raise _PrepareBlendAssetInputError(
+                "PREPARE_INVALID_OVERRIDES", "overrides.preview must be an object"
+            )
+        preview_unknown = set(preview) - {"width", "height", "views"}
+        if preview_unknown:
+            raise _PrepareBlendAssetInputError(
+                "PREPARE_INVALID_OVERRIDES",
+                "unsupported preview override field(s): "
+                + ", ".join(sorted(preview_unknown)),
+            )
+        for dimension in ("width", "height"):
+            if dimension in preview:
+                value = preview[dimension]
+                if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                    raise _PrepareBlendAssetInputError(
+                        "PREPARE_INVALID_OVERRIDES",
+                        f"overrides.preview.{dimension} must be a positive integer",
+                    )
+        if "views" in preview:
+            views = preview["views"]
+            supported_views = {"MAIN", "FRONT", "BACK", "LEFT", "RIGHT", "TOP"}
+            if (
+                not isinstance(views, list)
+                or not views
+                or any(not isinstance(view, str) or view not in supported_views for view in views)
+            ):
+                raise _PrepareBlendAssetInputError(
+                    "PREPARE_INVALID_OVERRIDES",
+                    "overrides.preview.views must contain supported view names",
+                )
+
+    # The current worker has deterministic profile presets but does not yet consume
+    # per-request overrides. Rejecting non-empty values is safer than silently
+    # accepting settings that would have no effect. Supplemental views are Task 5a.
+    raise _PrepareBlendAssetInputError(
+        "PREPARE_OVERRIDE_UNSUPPORTED",
+        "non-empty overrides are not supported by the current prepare worker",
+    )
+
+
+def _prepare_blend_asset_content(result: Dict[str, Any], profile: str) -> CallToolResult:
+    prepare_id = str(result.get("prepareId") or "")
+    observation = result.get("observation")
+    timings = result.get("timings")
+    raw_artifacts = result.get("artifacts")
+    if not prepare_id or not isinstance(observation, dict) or not isinstance(timings, dict):
+        raise AssetPrepareError(
+            "BLENDER_PREPARE_RESULT_INVALID: worker result is missing prepareId/observation/timings"
+        )
+    if not isinstance(raw_artifacts, list):
+        raise AssetPrepareError(
+            "BLENDER_PREPARE_RESULT_INVALID: worker result is missing artifact references"
+        )
+
+    store = get_prepared_artifact_store()
+    artifacts = []
+    main_preview = None
+    for raw in raw_artifacts:
+        if not isinstance(raw, dict):
+            raise AssetPrepareError(
+                "BLENDER_PREPARE_RESULT_INVALID: artifact reference must be an object"
+            )
+        artifact_id = raw.get("artifact_id")
+        kind = raw.get("kind")
+        if not isinstance(artifact_id, str) or not artifact_id or not isinstance(kind, str):
+            raise AssetPrepareError(
+                "BLENDER_PREPARE_RESULT_INVALID: artifact reference is missing id/kind"
+            )
+        path = store.resolve(artifact_id)
+        public_ref = {
+            "artifactId": artifact_id,
+            "kind": kind,
+            "fileName": path.name,
+            "size": raw.get("size"),
+            "sha256": raw.get("sha256"),
+            "mimeType": raw.get("content_type"),
+            "expiresAt": raw.get("expires_at"),
+        }
+        artifacts.append(public_ref)
+        if kind == "PREVIEW" and main_preview is None:
+            main_preview = path
+
+    if main_preview is None:
+        raise AssetPrepareError(
+            "BLENDER_PREPARE_ARTIFACT_MISSING: MAIN preview artifact is missing"
+        )
+
+    structured: Dict[str, Any] = {
+        "prepareId": prepare_id,
+        "observation": observation,
+        "artifacts": artifacts,
+        "warnings": result.get("warnings") if isinstance(result.get("warnings"), list) else [],
+        "timings": timings,
+    }
+    if isinstance(result.get("validation"), dict):
+        structured["validation"] = result["validation"]
+
+    object_count = observation.get("structure", {}).get("objectCount")
+    object_summary = f", {object_count} object(s)" if isinstance(object_count, int) else ""
+    summary = (
+        f"Prepared Blender asset {prepare_id} with profile {profile}{object_summary}; "
+        f"{len(artifacts)} prepared artifact(s)."
+    )
+    return CallToolResult(
+        content=[
+            TextContent(type="text", text=summary),
+            Image(path=main_preview, format="png").to_image_content(),
+        ],
+        structuredContent=structured,
+        isError=False,
+    )
+
+
+@mcp.tool()
+async def prepare_blend_asset(
+    source: Dict[str, Any],
+    profile: str,
+    overrides: Dict[str, Any] | None = None,
+) -> CallToolResult:
+    """Prepare one .blend or the current Blender selection in an isolated worker.
+
+    BLEND_FILE never touches the GUI socket. CURRENT_SELECTION performs one
+    ASSET_CLOSURE snapshot handoff, then uses the same background pipeline.
+    The result carries structured observation/artifact data plus the MAIN image.
+    """
+    try:
+        source_kind, source_path = _validate_prepare_source(source)
+        if profile not in SUPPORTED_ASSET_PROFILES:
+            raise _PrepareBlendAssetInputError(
+                "PREPARE_INVALID_PROFILE",
+                f"profile must be one of {', '.join(SUPPORTED_ASSET_PROFILES)}",
+            )
+        _validate_prepare_overrides(overrides)
+
+        if source_kind == "BLEND_FILE":
+            prepared = await asyncio.to_thread(
+                prepare_blend_file,
+                source_path,
+                profile=profile,
+                source_kind="BLEND_FILE",
+            )
+            return _prepare_blend_asset_content(prepared, profile)
+
+        with tempfile.TemporaryDirectory(prefix="blendermcp-selection-") as snapshot_dir:
+            snapshot_path = Path(snapshot_dir) / "current-selection.blend"
+            try:
+                create_blend_snapshot(
+                    str(snapshot_path), closure_mode="ASSET_CLOSURE"
+                )
+            except Exception as exc:
+                return _stable_prepare_error(exc, "CURRENT_SELECTION_SNAPSHOT_FAILED")
+            if not snapshot_path.is_file():
+                return _prepare_blend_asset_error(
+                    "CURRENT_SELECTION_SHARED_FILESYSTEM_REQUIRED",
+                    "selection snapshot is not visible to the Blender MCP server filesystem",
+                )
+            prepared = await asyncio.to_thread(
+                prepare_blend_file,
+                snapshot_path,
+                profile=profile,
+                source_kind="CURRENT_SELECTION",
+            )
+            return _prepare_blend_asset_content(prepared, profile)
+    except _PrepareBlendAssetInputError as exc:
+        return _prepare_blend_asset_error(exc.code, exc.message)
+    except AssetPrepareError as exc:
+        return _stable_prepare_error(exc, "BLENDER_PREPARE_FAILED")
+    except FileNotFoundError as exc:
+        return _stable_prepare_error(exc, "BLEND_SOURCE_NOT_FOUND")
+    except ValueError as exc:
+        return _stable_prepare_error(exc, "BLENDER_PREPARE_INVALID")
+    except Exception as exc:
+        logger.exception("prepare_blend_asset failed")
+        return _stable_prepare_error(exc, "BLENDER_PREPARE_FAILED")
 
 
 @mcp.tool()
