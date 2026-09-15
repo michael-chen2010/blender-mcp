@@ -254,3 +254,21 @@ def test_bundled_asset_prepare_worker_exists_next_to_addon():
     worker = bundled_dir / "asset_prepare_worker.py"
 
     assert worker.is_file(), "packaged asset preparation worker is missing"
+
+
+def test_snapshot_protocol_bump_marks_v5_addon_outdated():
+    assert EXPECTED_ADDON_PROTOCOL_VERSION == 6
+    blender = MagicMock()
+    blender.send_command.return_value = {
+        "protocol_version": 5,
+        "addon_version": [1, 6],
+        "capabilities": ["get_addon_info"],
+        "blender_version": "4.5.0",
+    }
+
+    result = handshake_addon(blender)
+
+    assert result.up_to_date is False
+    assert result.protocol_version == 5
+    assert "expected 6" in (result.warning or "")
+    assert "install-addon" in (result.warning or "")

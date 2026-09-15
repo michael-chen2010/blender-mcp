@@ -37,7 +37,7 @@ bl_info = {
 }
 
 # Keep in sync with blender_mcp.addon_manager.EXPECTED_ADDON_PROTOCOL_VERSION.
-ADDON_PROTOCOL_VERSION = 5
+ADDON_PROTOCOL_VERSION = 6
 
 # Per-snapshot object cap for get_world_state_snapshot. Keep in sync with
 # blender_mcp.trajectory.MAX_SNAPSHOT_OBJECTS.
@@ -764,6 +764,7 @@ class BlenderMCPServer:
             "get_scene_info": self.get_scene_info,
             "get_world_state_snapshot": self.get_world_state_snapshot,
             "get_addon_info": self.get_addon_info,
+            "create_blend_snapshot": self.create_blend_snapshot,
             "get_object_info": self.get_object_info,
             "get_viewport_screenshot": self.get_viewport_screenshot,
             "execute_code": self.execute_code,
@@ -848,6 +849,7 @@ class BlenderMCPServer:
                 "get_scene_info",
                 "get_world_state_snapshot",
                 "get_addon_info",
+                "create_blend_snapshot",
                 "get_object_info",
                 "get_viewport_screenshot",
                 "execute_code",
@@ -857,6 +859,268 @@ class BlenderMCPServer:
             ]),
             "blender_version": bpy.app.version_string,
             "blender_binary_path": bpy.app.binary_path,
+        }
+
+    @staticmethod
+    def _snapshot_id_key(value):
+        """Return a stable identity key for a Blender datablock or test double."""
+        if value is None:
+            return None
+        as_pointer = getattr(value, "as_pointer", None)
+        if callable(as_pointer):
+            try:
+                return (type(value).__name__, int(as_pointer()))
+            except Exception:
+                pass
+        return (type(value).__name__, id(value))
+
+    @classmethod
+    def _snapshot_append_unique(cls, values, seen, value):
+        if value is None:
+            return False
+        key = cls._snapshot_id_key(value)
+        if key in seen:
+            return False
+        seen.add(key)
+        values.append(value)
+        return True
+
+    def _collect_snapshot_objects(self, selected_objects, closure_mode="ASSET_CLOSURE"):
+        """Collect selected asset objects without mutating Blender selection/state."""
+        valid_modes = {"SELECTED_ONLY", "INCLUDE_DESCENDANTS", "ASSET_CLOSURE"}
+        if closure_mode not in valid_modes:
+            raise ValueError(
+                f"Unsupported closureMode {closure_mode!r}; expected one of {sorted(valid_modes)}"
+            )
+
+        objects = []
+        seen = set()
+        for obj in selected_objects:
+            self._snapshot_append_unique(objects, seen, obj)
+
+        if closure_mode in {"INCLUDE_DESCENDANTS", "ASSET_CLOSURE"}:
+            index = 0
+            while index < len(objects):
+                obj = objects[index]
+                index += 1
+                for child in getattr(obj, "children", ()) or ():
+                    self._snapshot_append_unique(objects, seen, child)
+
+        if closure_mode == "ASSET_CLOSURE":
+            dependency_attrs = (
+                "object",
+                "target",
+                "mirror_object",
+                "offset_object",
+                "origin",
+                "start_cap",
+                "end_cap",
+            )
+            index = 0
+            while index < len(objects):
+                obj = objects[index]
+                index += 1
+
+                # Preserve a parent needed by a selected loose child while still
+                # avoiding unrelated siblings/scene content.
+                self._snapshot_append_unique(objects, seen, getattr(obj, "parent", None))
+
+                for modifier in getattr(obj, "modifiers", ()) or ():
+                    for attr in dependency_attrs:
+                        self._snapshot_append_unique(
+                            objects, seen, getattr(modifier, attr, None)
+                        )
+
+                for constraint in getattr(obj, "constraints", ()) or ():
+                    for attr in ("target", "pole_target"):
+                        self._snapshot_append_unique(
+                            objects, seen, getattr(constraint, attr, None)
+                        )
+
+                pose = getattr(obj, "pose", None)
+                for bone in getattr(pose, "bones", ()) or ():
+                    for constraint in getattr(bone, "constraints", ()) or ():
+                        for attr in ("target", "pole_target"):
+                            self._snapshot_append_unique(
+                                objects, seen, getattr(constraint, attr, None)
+                            )
+
+                find_armature = getattr(obj, "find_armature", None)
+                if callable(find_armature):
+                    try:
+                        self._snapshot_append_unique(objects, seen, find_armature())
+                    except Exception:
+                        pass
+
+        return objects
+
+    def _collect_snapshot_datablocks(self, selected_objects, closure_mode="ASSET_CLOSURE"):
+        """Collect object and explicit material/image datablocks for library write."""
+        objects = self._collect_snapshot_objects(selected_objects, closure_mode)
+        datablocks = []
+        seen = set()
+        materials = []
+        material_seen = set()
+
+        for obj in objects:
+            self._snapshot_append_unique(datablocks, seen, obj)
+            data = getattr(obj, "data", None)
+            self._snapshot_append_unique(datablocks, seen, data)
+
+            for material in getattr(data, "materials", ()) or ():
+                self._snapshot_append_unique(materials, material_seen, material)
+            for slot in getattr(obj, "material_slots", ()) or ():
+                self._snapshot_append_unique(
+                    materials, material_seen, getattr(slot, "material", None)
+                )
+
+        node_trees = []
+        node_tree_seen = set()
+        for material in materials:
+            self._snapshot_append_unique(datablocks, seen, material)
+            if not getattr(material, "use_nodes", False):
+                continue
+            node_tree = getattr(material, "node_tree", None)
+            if node_tree is not None:
+                self._snapshot_append_unique(node_trees, node_tree_seen, node_tree)
+
+        # Embedded material node trees are traversed, not written directly.
+        # External group node trees and images are explicit dependencies.
+        index = 0
+        while index < len(node_trees):
+            node_tree = node_trees[index]
+            index += 1
+            for node in getattr(node_tree, "nodes", ()) or ():
+                self._snapshot_append_unique(
+                    datablocks, seen, getattr(node, "image", None)
+                )
+                group_tree = getattr(node, "node_tree", None)
+                if group_tree is not None:
+                    self._snapshot_append_unique(node_trees, node_tree_seen, group_tree)
+                    self._snapshot_append_unique(datablocks, seen, group_tree)
+
+        return datablocks
+
+    @staticmethod
+    def _snapshot_vector(value):
+        if value is None:
+            return ()
+        try:
+            return tuple(round(float(component), 12) for component in value)
+        except Exception:
+            return (repr(value),)
+
+    def _capture_snapshot_guard_state(self):
+        """Capture the GUI state whose mutation would violate snapshot semantics."""
+        scene = bpy.context.scene
+        view_layer = getattr(bpy.context, "view_layer", None)
+        layer_objects = getattr(view_layer, "objects", None)
+        active = getattr(layer_objects, "active", None)
+        objects = sorted(list(getattr(bpy.data, "objects", ()) or ()), key=lambda o: o.name)
+        transforms = tuple(
+            (
+                obj.name,
+                self._snapshot_vector(getattr(obj, "location", None)),
+                self._snapshot_vector(getattr(obj, "rotation_euler", None)),
+                self._snapshot_vector(getattr(obj, "scale", None)),
+            )
+            for obj in objects
+        )
+        return {
+            "filepath": getattr(bpy.data, "filepath", ""),
+            "scene": getattr(scene, "name", None),
+            "selected": tuple(obj.name for obj in bpy.context.selected_objects),
+            "active": getattr(active, "name", None),
+            "objectNames": tuple(obj.name for obj in objects),
+            "transforms": transforms,
+            "isDirty": bool(getattr(bpy.data, "is_dirty", False)),
+        }
+
+    def _snapshot_source_fingerprint(self, source_path, root_names, included_objects):
+        records = []
+        for obj in sorted(included_objects, key=lambda value: value.name):
+            records.append(
+                {
+                    "name": obj.name,
+                    "type": getattr(obj, "type", None),
+                    "data": getattr(getattr(obj, "data", None), "name", None),
+                    "location": self._snapshot_vector(getattr(obj, "location", None)),
+                    "rotation": self._snapshot_vector(getattr(obj, "rotation_euler", None)),
+                    "scale": self._snapshot_vector(getattr(obj, "scale", None)),
+                }
+            )
+        payload = {
+            "sourceBlendPath": source_path or None,
+            "rootObjectNames": sorted(root_names),
+            "objects": records,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    def create_blend_snapshot(
+        self,
+        filepath,
+        selectionMode="CURRENT_SELECTION",
+        closureMode="ASSET_CLOSURE",
+    ):
+        """Write the current selected asset closure to a standalone .blend file."""
+        if selectionMode != "CURRENT_SELECTION":
+            raise ValueError("selectionMode must be CURRENT_SELECTION")
+        if not filepath or not isinstance(filepath, str):
+            raise ValueError("filepath must be a non-empty string")
+        target = os.path.abspath(os.path.expanduser(filepath))
+        if not target.lower().endswith(".blend"):
+            raise ValueError("snapshot filepath must end with .blend")
+
+        selected = list(bpy.context.selected_objects)
+        if not selected:
+            raise ValueError("CURRENT_SELECTION requires at least one selected object")
+
+        before = self._capture_snapshot_guard_state()
+        included_objects = self._collect_snapshot_objects(selected, closureMode)
+        datablocks = self._collect_snapshot_datablocks(selected, closureMode)
+        selected_keys = {self._snapshot_id_key(obj) for obj in selected}
+        root_names = [
+            obj.name
+            for obj in selected
+            if self._snapshot_id_key(getattr(obj, "parent", None)) not in selected_keys
+        ]
+
+        parent_dir = os.path.dirname(target)
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
+        try:
+            bpy.data.libraries.write(
+                target,
+                set(datablocks),
+                path_remap="ABSOLUTE",
+                fake_user=False,
+                compress=False,
+            )
+            after = self._capture_snapshot_guard_state()
+            if after != before:
+                raise RuntimeError(
+                    "create_blend_snapshot mutated the active Blender document; snapshot rejected"
+                )
+            if not os.path.isfile(target):
+                raise RuntimeError("Blender did not create the requested snapshot file")
+        except Exception:
+            with suppress(OSError):
+                if os.path.isfile(target):
+                    os.remove(target)
+            raise
+
+        included_names = sorted(obj.name for obj in included_objects)
+        return {
+            "filepath": target,
+            "rootObjectNames": sorted(root_names),
+            "includedObjectNames": included_names,
+            "sourceBlendPath": before["filepath"] or None,
+            "blenderVersion": bpy.app.version_string,
+            "sourceFingerprint": self._snapshot_source_fingerprint(
+                before["filepath"], root_names, included_objects
+            ),
         }
 
     def get_scene_info(self):

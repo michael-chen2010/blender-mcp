@@ -312,6 +312,43 @@ def get_blender_connection():
     return _blender_connection
 
 
+def create_blend_snapshot(
+    filepath: str,
+    *,
+    closure_mode: str = "ASSET_CLOSURE",
+) -> Dict[str, Any]:
+    """Ask the GUI Add-on to snapshot CURRENT_SELECTION on Blender's main thread."""
+    valid_modes = {"SELECTED_ONLY", "INCLUDE_DESCENDANTS", "ASSET_CLOSURE"}
+    if not isinstance(filepath, str) or not filepath:
+        raise ValueError("filepath must be a non-empty string")
+    if closure_mode not in valid_modes:
+        raise ValueError(
+            f"Unsupported closure_mode {closure_mode!r}; expected one of {sorted(valid_modes)}"
+        )
+
+    blender = get_blender_connection()
+    with _addon_handshake_lock:
+        handshake = _addon_handshake
+    if (
+        handshake is not None
+        and handshake.source == "native"
+        and "create_blend_snapshot" not in handshake.capabilities
+    ):
+        raise RuntimeError(
+            "Connected Blender Add-on does not advertise create_blend_snapshot. "
+            "Run `uvx blender-mcp install-addon`, then restart Blender or re-enable the Add-on."
+        )
+
+    return blender.send_command(
+        "create_blend_snapshot",
+        {
+            "filepath": filepath,
+            "selectionMode": "CURRENT_SELECTION",
+            "closureMode": closure_mode,
+        },
+    )
+
+
 @mcp.tool()
 async def get_addon_status(ctx: Context, user_prompt: str = "") -> str:
     """
