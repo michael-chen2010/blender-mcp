@@ -230,3 +230,27 @@ def test_repeat_install_preserves_original_backup(tmp_path: Path):
     assert "USER LOCAL EDIT" in backup.read_text(encoding="utf-8"), (
         "repeat install clobbered the backup of the user's previous addon"
     )
+
+
+def test_handshake_exposes_local_blender_binary_path_when_reported():
+    blender = MagicMock()
+    blender.send_command.return_value = {
+        "protocol_version": EXPECTED_ADDON_PROTOCOL_VERSION,
+        "addon_version": [1, 6],
+        "capabilities": ["get_addon_info"],
+        "blender_version": "4.5.0",
+        "blender_binary_path": "C:/Program Files/Blender Foundation/Blender/blender.exe",
+    }
+
+    result = handshake_addon(blender)
+
+    assert result.blender_binary_path.endswith("blender.exe")
+
+
+def test_bundled_asset_prepare_worker_exists_next_to_addon():
+    import blender_mcp
+
+    bundled_dir = Path(blender_mcp.__file__).resolve().parent / "bundled"
+    worker = bundled_dir / "asset_prepare_worker.py"
+
+    assert worker.is_file(), "packaged asset preparation worker is missing"

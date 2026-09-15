@@ -856,6 +856,7 @@ class BlenderMCPServer:
                 "set_telemetry_consent",
             ]),
             "blender_version": bpy.app.version_string,
+            "blender_binary_path": bpy.app.binary_path,
         }
 
     def get_scene_info(self):

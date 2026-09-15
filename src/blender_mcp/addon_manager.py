@@ -168,6 +168,7 @@ class AddonHandshake:
     capabilities: list[str]
     blender_version: str | None
     source: str  # native | missing | error
+    blender_binary_path: str | None = None
     warning: str | None = None
 
 
@@ -404,6 +405,7 @@ def handshake_addon(blender_connection) -> AddonHandshake:
             capabilities=list(info.get("capabilities") or []),
             blender_version=info.get("blender_version"),
             source="native",
+            blender_binary_path=info.get("blender_binary_path"),
             warning=warning,
         )
     except Exception as e:

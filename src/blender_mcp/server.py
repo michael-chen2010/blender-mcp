@@ -28,6 +28,13 @@ from .addon_manager import (
 )
 from .consent_prompt import maybe_prompt_for_consent
 from .safe_mode import safe_mode_enabled, validate_code, SandboxViolation, SAFE_MODE_ENV
+from .blender_runtime import (
+    ASSET_HARD_CAP,
+    SUPPORTED_ASSET_PROFILES,
+    configured_asset_concurrency,
+    recommended_asset_concurrency,
+    resolve_blender_runtime,
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO,
@@ -344,6 +351,47 @@ async def get_addon_status(ctx: Context, user_prompt: str = "") -> str:
         return json.dumps(payload, indent=2) + await maybe_prompt_for_consent(ctx)
     except Exception as e:
         return f"Error checking addon status: {e}"
+
+
+@mcp.tool()
+def get_asset_pipeline_status() -> str:
+    """Report local background asset-pipeline capability without touching Blender GUI."""
+    cpu_count = os.cpu_count()
+    with _addon_handshake_lock:
+        handshake = _addon_handshake
+    addon_binary_path = (
+        handshake.blender_binary_path if handshake is not None else None
+    )
+    blender_host = os.getenv("BLENDER_HOST", DEFAULT_HOST)
+
+    runtime = None
+    try:
+        runtime = resolve_blender_runtime(
+            addon_binary_path=addon_binary_path,
+            blender_host=blender_host,
+        )
+    except FileNotFoundError:
+        pass
+
+    recommended = recommended_asset_concurrency(cpu_count)
+    configured = configured_asset_concurrency(cpu_count)
+    blender_version = None
+    if runtime is not None and runtime.source == "LOCAL_ADDON" and handshake is not None:
+        blender_version = handshake.blender_version
+
+    return json.dumps(
+        {
+            "available": runtime is not None,
+            "source": runtime.source if runtime is not None else None,
+            "blenderVersion": blender_version,
+            "supportedProfiles": list(SUPPORTED_ASSET_PROFILES),
+            "cpuCount": cpu_count,
+            "recommendedConcurrency": recommended,
+            "configuredMaxConcurrency": configured,
+            "hardCap": ASSET_HARD_CAP,
+        },
+        indent=2,
+    )
 
 
 @mcp.tool()
