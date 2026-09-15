@@ -44,6 +44,7 @@ from .asset_pipeline import (
     render_supplemental_view,
 )
 from .prepared_observation import PreparedObservationError, PreparedObservationService
+from .file_transfer import FileTransferError, PreparedArtifactTransferService
 
 # Configure logging
 logging.basicConfig(level=logging.INFO,
@@ -59,6 +60,8 @@ _addon_handshake_checked = False
 _addon_handshake_lock = threading.Lock()
 _prepared_observation_service: PreparedObservationService | None = None
 _prepared_observation_service_lock = threading.Lock()
+_prepared_artifact_transfer_service: PreparedArtifactTransferService | None = None
+_prepared_artifact_transfer_service_lock = threading.Lock()
 
 @dataclass
 class BlenderConnection:
@@ -494,6 +497,19 @@ def get_prepared_observation_service() -> PreparedObservationService:
     return _prepared_observation_service
 
 
+def get_prepared_artifact_transfer_service() -> PreparedArtifactTransferService:
+    """Return the process-wide prepared artifact transfer service used across MCP calls."""
+
+    global _prepared_artifact_transfer_service
+    if _prepared_artifact_transfer_service is None:
+        with _prepared_artifact_transfer_service_lock:
+            if _prepared_artifact_transfer_service is None:
+                _prepared_artifact_transfer_service = PreparedArtifactTransferService(
+                    get_prepared_artifact_store()
+                )
+    return _prepared_artifact_transfer_service
+
+
 def _validate_prepare_source(source: Dict[str, Any]) -> tuple[str, Path | None]:
     if not isinstance(source, dict):
         raise _PrepareBlendAssetInputError(
@@ -819,6 +835,124 @@ async def render_prepared_asset_view(
     except Exception as exc:
         logger.exception("render_prepared_asset_view failed")
         return _stable_prepare_error(exc, "BLENDER_SUPPLEMENTAL_FAILED")
+
+
+@mcp.tool()
+async def upload_prepared_artifact(
+    artifact_id: str,
+    method: str,
+    signed_url: str,
+    headers: Dict[str, str] | None = None,
+    expected_size: int | None = None,
+    expected_sha256: str | None = None,
+) -> CallToolResult:
+    """Stream one registered prepared artifact to a caller-provided signed URL."""
+
+    try:
+        result = await get_prepared_artifact_transfer_service().upload_prepared_artifact(
+            artifact_id,
+            method,
+            signed_url,
+            headers,
+            expected_size=expected_size,
+            expected_sha256=expected_sha256,
+        )
+        timings = result.get("timings") if isinstance(result.get("timings"), dict) else {}
+        summary = (
+            f"Prepared artifact {artifact_id} uploaded successfully"
+            f" ({timings.get('bytes', 0)} bytes, HTTP {timings.get('httpStatus', 0)})."
+        )
+        return CallToolResult(
+            content=[TextContent(type="text", text=summary)],
+            structuredContent=result,
+            isError=False,
+        )
+    except FileTransferError as exc:
+        return _prepare_blend_asset_error(exc.code, exc.message)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.error("upload_prepared_artifact failed with an internal error")
+        return _prepare_blend_asset_error("UPLOAD_FAILED", "Prepared artifact upload failed")
+
+
+@mcp.tool()
+async def start_upload_prepared_artifacts(
+    batch_prepare_id: str,
+    items: List[Dict[str, Any]],
+    idempotency_key: str,
+    upload_id: str | None = None,
+    concurrency: int | None = None,
+) -> CallToolResult:
+    """Start or retry a local asynchronous prepared-artifact upload job."""
+
+    try:
+        result = await get_prepared_artifact_transfer_service().start_upload_prepared_artifacts(
+            batch_prepare_id,
+            items,
+            idempotency_key,
+            upload_id=upload_id,
+            concurrency=concurrency,
+        )
+        summary = f"Upload job {result['uploadId']} is {result['status']}."
+        return CallToolResult(
+            content=[TextContent(type="text", text=summary)],
+            structuredContent=result,
+            isError=False,
+        )
+    except FileTransferError as exc:
+        return _prepare_blend_asset_error(exc.code, exc.message)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.error("start_upload_prepared_artifacts failed with an internal error")
+        return _prepare_blend_asset_error("UPLOAD_JOB_FAILED", "Prepared artifact upload job failed")
+
+
+@mcp.tool()
+def get_upload_prepared_artifacts(
+    upload_id: str,
+    cursor: str | None = None,
+) -> CallToolResult:
+    """Return one bounded page of a local prepared-artifact upload job."""
+
+    try:
+        result = get_prepared_artifact_transfer_service().get_upload_prepared_artifacts(
+            upload_id,
+            cursor,
+        )
+        summary = f"Upload job {result['uploadId']} is {result['status']}."
+        return CallToolResult(
+            content=[TextContent(type="text", text=summary)],
+            structuredContent=result,
+            isError=False,
+        )
+    except FileTransferError as exc:
+        return _prepare_blend_asset_error(exc.code, exc.message)
+    except Exception:
+        logger.error("get_upload_prepared_artifacts failed with an internal error")
+        return _prepare_blend_asset_error("UPLOAD_JOB_FAILED", "Prepared artifact upload job lookup failed")
+
+
+@mcp.tool()
+async def cancel_upload_prepared_artifacts(upload_id: str) -> CallToolResult:
+    """Cancel active work for a local prepared-artifact upload job."""
+
+    try:
+        result = await get_prepared_artifact_transfer_service().cancel_upload_prepared_artifacts(upload_id)
+        summary = f"Upload job {result['uploadId']} is {result['status']}."
+        return CallToolResult(
+            content=[TextContent(type="text", text=summary)],
+            structuredContent=result,
+            isError=False,
+        )
+    except FileTransferError as exc:
+        return _prepare_blend_asset_error(exc.code, exc.message)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.error("cancel_upload_prepared_artifacts failed with an internal error")
+        return _prepare_blend_asset_error("UPLOAD_JOB_FAILED", "Prepared artifact upload cancellation failed")
 
 
 @mcp.tool()

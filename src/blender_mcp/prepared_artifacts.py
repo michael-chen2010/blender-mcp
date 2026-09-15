@@ -248,6 +248,37 @@ class PreparedArtifactStore:
                 )
             return current_path
 
+    def artifact_prepare_id(self, artifact_id: str) -> str:
+        """Return the owning prepare id for a live opaque artifact handle."""
+
+        with self._lock:
+            record = self._artifacts.get(artifact_id)
+            if record is None:
+                raise PreparedArtifactError(
+                    "PREPARED_ARTIFACT_NOT_FOUND",
+                    "Unknown prepared artifact id",
+                )
+            if self._clock() >= record.expires_at_epoch:
+                raise PreparedArtifactError(
+                    "PREPARED_ARTIFACT_EXPIRED",
+                    "Prepared artifact has expired",
+                )
+            self._workspace_for_read(record.prepare_id)
+            return record.prepare_id
+
+    def artifact_ref(self, artifact_id: str) -> PreparedArtifactRef:
+        """Return immutable public identity for a live opaque artifact handle."""
+
+        with self._lock:
+            prepare_id = self.artifact_prepare_id(artifact_id)
+            record = self._artifacts.get(artifact_id)
+            if record is None or record.prepare_id != prepare_id:
+                raise PreparedArtifactError(
+                    "PREPARED_ARTIFACT_NOT_FOUND",
+                    "Prepared artifact is unavailable",
+                )
+            return record.ref
+
     def _workspace_for_read(self, prepare_id: str) -> _WorkspaceRecord:
         workspace = self._workspaces.get(prepare_id)
         if workspace is None:
