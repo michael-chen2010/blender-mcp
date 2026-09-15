@@ -158,3 +158,55 @@ def test_artifact_identity_hashes_exact_native_and_gzip_bytes(tmp_path: Path):
     assert gzip_ref.size == len(gzip_bytes)
     assert gzip_ref.sha256 == _sha256_bytes(gzip_bytes)
     assert gzip_ref.sha256 != native_ref.sha256
+
+
+def test_retained_evidence_identity_and_observation_cache_are_workspace_bound(tmp_path: Path):
+    workspace = tmp_path / "prepare-observation"
+    workspace.mkdir()
+    retained = workspace / "source.blend"
+    retained_bytes = b"BLENDER-retained-evidence"
+    retained.write_bytes(retained_bytes)
+    cache = workspace / "observation-cache.json"
+    cache.write_text('{"prepareId":"prepare-observation"}', encoding="utf-8")
+
+    store = PreparedArtifactStore(ttl_seconds=60)
+    store.register_workspace(
+        "prepare-observation",
+        workspace,
+        retained_source_path=retained,
+        retained_source_kind="SOURCE_SNAPSHOT",
+        observation_cache_path=cache,
+    )
+
+    assert store.evidence_identity("prepare-observation") == {
+        "prepareId": "prepare-observation",
+        "kind": "SOURCE_SNAPSHOT",
+        "size": len(retained_bytes),
+        "sha256": _sha256_bytes(retained_bytes),
+    }
+    assert store.observation_cache_path("prepare-observation") == cache.resolve()
+
+    retained.write_bytes(retained_bytes + b"-tampered")
+    with pytest.raises(PreparedArtifactError) as exc_info:
+        store.evidence_identity("prepare-observation")
+    assert exc_info.value.code == "PREPARED_ARTIFACT_CHECKSUM_MISMATCH"
+
+
+def test_register_workspace_rejects_observation_cache_outside_workspace(tmp_path: Path):
+    workspace = tmp_path / "prepare-cache-safe"
+    workspace.mkdir()
+    retained = workspace / "source.blend"
+    retained.write_bytes(b"BLENDER-source")
+    outside_cache = tmp_path / "outside-observation.json"
+    outside_cache.write_text("{}", encoding="utf-8")
+
+    store = PreparedArtifactStore()
+    with pytest.raises(PreparedArtifactError) as exc_info:
+        store.register_workspace(
+            "prepare-cache-safe",
+            workspace,
+            retained_source_path=retained,
+            retained_source_kind="SOURCE_SNAPSHOT",
+            observation_cache_path=outside_cache,
+        )
+    assert exc_info.value.code == "PREPARED_ARTIFACT_INVALID_PATH"

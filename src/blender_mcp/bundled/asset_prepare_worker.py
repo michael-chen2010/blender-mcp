@@ -14,7 +14,7 @@ import time
 from typing import Any, Callable, Iterable
 
 SUPPORTED_PROFILES = ("PREVIEW", "METADATA", "PUBLISH")
-WORKER_PROTOCOL_VERSION = 3
+WORKER_PROTOCOL_VERSION = 4
 OBSERVATION_SCHEMA_VERSION = 1
 ANALYZER_VERSION = "blender-mcp-observation-v1"
 PREVIEW_PRESET_VERSION = "asset-preview-v1"
@@ -22,6 +22,7 @@ OBJECT_DETAIL_LIMIT = 50
 MATERIAL_DETAIL_LIMIT = 30
 PREVIEW_WIDTH = 512
 PREVIEW_HEIGHT = 512
+SUPPLEMENTAL_VIEWS = ("FRONT", "BACK", "LEFT", "RIGHT", "TOP")
 PUBLISH_DIMENSION_TOLERANCE_METERS = 1e-5
 
 
@@ -887,9 +888,20 @@ def _aim_at(obj: Any, target: Any) -> None:
     obj.rotation_euler = direction.to_track_quat("-Z", "Y").to_euler()
 
 
-def render_main_preview(bpy: Any, observation: dict[str, Any], output_path: str) -> dict[str, Any]:
-    """Render the standard deterministic three-quarter MAIN image in worker memory."""
+def render_preview_view(bpy: Any, output_path: str, view: str) -> dict[str, Any]:
+    """Render one deterministic evidence view without saving the modified scene."""
     from mathutils import Vector  # type: ignore
+
+    directions = {
+        "THREE_QUARTER": Vector((1.35, -1.55, 1.05)),
+        "FRONT": Vector((0.0, -1.0, 0.0)),
+        "BACK": Vector((0.0, 1.0, 0.0)),
+        "LEFT": Vector((-1.0, 0.0, 0.0)),
+        "RIGHT": Vector((1.0, 0.0, 0.0)),
+        "TOP": Vector((0.0, 0.0, 1.0)),
+    }
+    if view not in directions:
+        raise ValueError(f"Unsupported preview view: {view}")
 
     scene = bpy.context.scene
     center, max_dimension = _preview_world_bounds(bpy)
@@ -909,7 +921,7 @@ def render_main_preview(bpy: Any, observation: dict[str, Any], output_path: str)
     camera_data.lens = 52.0
     camera_data.clip_start = max(0.001, max_dimension / 1000.0)
     camera_data.clip_end = max(1000.0, max_dimension * 20.0)
-    direction = Vector((1.35, -1.55, 1.05)).normalized()
+    direction = directions[view].normalized()
     camera.location = center + direction * (max_dimension * 2.5 + 0.75)
     _aim_at(camera, center)
     scene.camera = camera
@@ -960,13 +972,19 @@ def render_main_preview(bpy: Any, observation: dict[str, Any], output_path: str)
     scene.render.filepath = str(target)
     bpy.ops.render.render(write_still=True)
     if not target.is_file():
-        raise RuntimeError("Preview render completed without producing MAIN PNG")
+        raise RuntimeError("Preview render completed without producing PNG")
 
     return {
         "width": PREVIEW_WIDTH,
         "height": PREVIEW_HEIGHT,
-        "view": "THREE_QUARTER",
+        "view": view,
     }
+
+
+def render_main_preview(bpy: Any, observation: dict[str, Any], output_path: str) -> dict[str, Any]:
+    """Render the standard deterministic three-quarter MAIN image in worker memory."""
+    _ = observation
+    return render_preview_view(bpy, output_path, "THREE_QUARTER")
 
 
 def _remove_preview_rig(bpy: Any) -> None:
@@ -1092,7 +1110,72 @@ def _write_json(path: str | Path, payload: dict[str, Any]) -> None:
     os.replace(temporary, target)
 
 
+def _run_supplemental_view_job(job: dict[str, Any]) -> dict[str, Any]:
+    prepare_id = str(job.get("prepareId") or "")
+    source_path = str(job.get("sourcePath") or "")
+    preview_path = str(job.get("previewPath") or "")
+    result_path = str(job.get("resultPath") or "")
+    view = str(job.get("view") or "")
+    if not prepare_id:
+        raise ValueError("job.prepareId is required")
+    if view not in SUPPLEMENTAL_VIEWS:
+        raise ValueError(f"Unsupported supplemental view: {view}")
+    if not source_path or not Path(source_path).is_file():
+        raise FileNotFoundError(f"job.sourcePath does not exist: {source_path}")
+    if not preview_path:
+        raise ValueError("job.previewPath is required")
+    if not result_path:
+        raise ValueError("job.resultPath is required")
+
+    started = time.perf_counter()
+    bpy = _import_bpy()
+    try:
+        open_started = time.perf_counter()
+        bpy.ops.wm.open_mainfile(filepath=source_path)
+        open_ms = _elapsed_ms(open_started)
+        render_started = time.perf_counter()
+        preview_evidence = render_preview_view(bpy, preview_path, view)
+        render_ms = _elapsed_ms(render_started)
+        result = {
+            "status": "READY",
+            "prepareId": prepare_id,
+            "view": view,
+            "previewPath": preview_path,
+            "previewEvidence": preview_evidence,
+            "timings": {
+                "openMs": open_ms,
+                "renderMs": render_ms,
+                "totalMs": _elapsed_ms(started),
+            },
+        }
+        _write_json(result_path, result)
+        return result
+    except Exception as exc:
+        failed = {
+            "status": "FAILED",
+            "prepareId": prepare_id,
+            "view": view,
+            "error": {
+                "code": "WORKER_FAILED",
+                "message": str(exc),
+                "type": type(exc).__name__,
+            },
+            "timings": {"totalMs": _elapsed_ms(started)},
+        }
+        try:
+            _write_json(result_path, failed)
+        except Exception:
+            pass
+        raise
+
+
 def run_job(job: dict[str, Any]) -> dict[str, Any]:
+    mode = str(job.get("mode") or "PREPARE")
+    if mode == "SUPPLEMENTAL_VIEW":
+        return _run_supplemental_view_job(job)
+    if mode != "PREPARE":
+        raise ValueError(f"Unsupported worker mode: {mode}")
+
     prepare_id = str(job.get("prepareId") or "")
     profile = str(job.get("profile") or "")
     source_path = str(job.get("sourcePath") or "")
@@ -1227,6 +1310,23 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
                     "hashMs": hash_ms,
                 }
             )
+
+        observation_cache_path = str(job.get("observationCachePath") or "")
+        if observation_cache_path:
+            observation_cache = {
+                "prepareId": prepare_id,
+                "sections": {
+                    "STRUCTURE": observation["structure"],
+                    "GEOMETRY": observation["geometry"],
+                    "MATERIALS": observation["materials"],
+                    "DEFORMATION": observation["deformation"],
+                },
+            }
+            item_key = job.get("itemKey")
+            if isinstance(item_key, str) and item_key:
+                observation_cache["itemKey"] = item_key
+            _write_json(observation_cache_path, observation_cache)
+            result["observationCachePath"] = observation_cache_path
 
         timings["totalMs"] = _elapsed_ms(started)
         result["timings"] = timings

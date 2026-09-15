@@ -2,23 +2,31 @@
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import asynccontextmanager
 from dataclasses import asdict
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from typing import Any
 import uuid
+import weakref
 
-from .blender_runtime import BlenderRuntime, resolve_blender_runtime
+from .blender_runtime import BlenderRuntime, configured_asset_concurrency, resolve_blender_runtime
 from .prepared_artifacts import PreparedArtifactStore
 
 SUPPORTED_PROFILES = {"PREVIEW", "METADATA", "PUBLISH"}
+SUPPORTED_SUPPLEMENTAL_VIEWS = {"FRONT", "BACK", "LEFT", "RIGHT", "TOP"}
 _DEFAULT_TIMEOUT_SECONDS = 180.0
 _MAX_LOG_CHARS = 12_000
 _DEFAULT_ARTIFACT_STORE = PreparedArtifactStore()
+_ASSET_WORKER_SEMAPHORES: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = weakref.WeakKeyDictionary()
+_ASSET_WORKER_SEMAPHORE_LOCK = threading.Lock()
 
 
 class AssetPrepareError(RuntimeError):
@@ -29,6 +37,28 @@ def get_prepared_artifact_store() -> PreparedArtifactStore:
     """Return the server-process store shared by prepare/upload adapters."""
 
     return _DEFAULT_ARTIFACT_STORE
+
+
+def _asset_worker_semaphore() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    with _ASSET_WORKER_SEMAPHORE_LOCK:
+        semaphore = _ASSET_WORKER_SEMAPHORES.get(loop)
+        if semaphore is None:
+            semaphore = asyncio.Semaphore(configured_asset_concurrency(os.cpu_count()))
+            _ASSET_WORKER_SEMAPHORES[loop] = semaphore
+        return semaphore
+
+
+@asynccontextmanager
+async def asset_worker_slot():
+    """Share one worker limit across prepare and supplemental Blender jobs."""
+
+    semaphore = _asset_worker_semaphore()
+    await semaphore.acquire()
+    try:
+        yield
+    finally:
+        semaphore.release()
 
 
 def _worker_path() -> Path:
@@ -97,17 +127,24 @@ def _register_result_artifacts(
     work_dir: Path,
     source_snapshot: Path,
     result: dict[str, Any],
+    observation_cache_path: Path,
 ) -> None:
     preview_path = Path(str(result.get("previewPath") or ""))
     payload_path = Path(str(result.get("payloadPath") or "")) if profile == "PUBLISH" else None
     retained = payload_path if payload_path is not None else source_snapshot
     if retained is None or not retained.is_file():
         raise AssetPrepareError("BLENDER_PREPARE_ARTIFACT_MISSING: retained evidence file is missing")
+    if not observation_cache_path.is_file():
+        raise AssetPrepareError(
+            "BLENDER_PREPARE_ARTIFACT_MISSING: prepared observation cache is missing"
+        )
 
     store.register_workspace(
         prepare_id,
         work_dir,
         retained_source_path=retained,
+        retained_source_kind="PAYLOAD" if profile == "PUBLISH" else "SOURCE_SNAPSHOT",
+        observation_cache_path=observation_cache_path,
     )
     refs = []
     if preview_path.is_file():
@@ -181,6 +218,7 @@ def prepare_blend_file(
     preview_path = work_dir / "main.png"
     payload_path = work_dir / "payload.blend"
     result_path = work_dir / "result.json"
+    observation_cache_path = work_dir / "observation-cache.json"
     job = {
         "prepareId": prepare_id_value,
         "profile": profile,
@@ -190,6 +228,7 @@ def prepare_blend_file(
         "previewPath": str(preview_path),
         "payloadPath": str(payload_path),
         "resultPath": str(result_path),
+        "observationCachePath": str(observation_cache_path),
     }
     _write_job(job_path, job)
 
@@ -260,6 +299,7 @@ def prepare_blend_file(
         work_dir=work_dir,
         source_snapshot=source_snapshot,
         result=result,
+        observation_cache_path=observation_cache_path,
     )
     if profile == "PUBLISH":
         try:
@@ -267,3 +307,137 @@ def prepare_blend_file(
         except FileNotFoundError:
             pass
     return result
+
+
+def _decode_process_output(value: bytes | str | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
+async def _stop_async_process(process: Any) -> tuple[str, str]:
+    if process.returncode is None:
+        process.kill()
+    stdout, stderr = await process.communicate()
+    return _decode_process_output(stdout), _decode_process_output(stderr)
+
+
+async def render_supplemental_view(
+    *,
+    source_path: str | Path,
+    output_path: str | Path,
+    view: str,
+    prepare_id: str,
+    runtime: BlenderRuntime | None = None,
+    timeout: float = _DEFAULT_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Render one deterministic axis view from retained immutable evidence."""
+
+    source = Path(source_path).resolve()
+    output = Path(output_path).resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f"Retained Blend source does not exist: {source}")
+    if source.suffix.lower() != ".blend":
+        raise ValueError(f"Retained Blend source must end with .blend: {source}")
+    if view not in SUPPORTED_SUPPLEMENTAL_VIEWS:
+        raise ValueError(
+            f"Unsupported supplemental view {view!r}; expected one of {sorted(SUPPORTED_SUPPLEMENTAL_VIEWS)}"
+        )
+    if not prepare_id:
+        raise ValueError("prepare_id is required")
+    if timeout <= 0:
+        raise ValueError("timeout must be positive")
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    resolved_runtime = runtime or resolve_blender_runtime()
+    job_path = output.parent / f".{output.stem}.job.json"
+    result_path = output.parent / f".{output.stem}.result.json"
+    _write_job(
+        job_path,
+        {
+            "mode": "SUPPLEMENTAL_VIEW",
+            "prepareId": prepare_id,
+            "sourcePath": str(source),
+            "previewPath": str(output),
+            "resultPath": str(result_path),
+            "view": view,
+        },
+    )
+    command = [
+        resolved_runtime.executable,
+        "--background",
+        "--factory-startup",
+        "--disable-autoexec",
+        "--python",
+        str(_worker_path()),
+        "--",
+        "--job",
+        str(job_path),
+    ]
+
+    total_started = time.perf_counter()
+    process = None
+    try:
+        async with asset_worker_slot():
+            spawn_started = time.perf_counter()
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            process_spawn_ms = (time.perf_counter() - spawn_started) * 1000.0
+            try:
+                stdout_raw, stderr_raw = await asyncio.wait_for(
+                    process.communicate(), timeout=timeout
+                )
+                stdout = _decode_process_output(stdout_raw)
+                stderr = _decode_process_output(stderr_raw)
+            except asyncio.TimeoutError as exc:
+                stdout, stderr = await _stop_async_process(process)
+                raise AssetPrepareError(
+                    "BLENDER_SUPPLEMENTAL_TIMEOUT: background Blender exceeded "
+                    f"{timeout:.1f}s; stdout={_bounded_log(stdout)!r}; "
+                    f"stderr={_bounded_log(stderr)!r}"
+                ) from exc
+            except asyncio.CancelledError:
+                await _stop_async_process(process)
+                raise
+
+        result = _read_worker_result(result_path)
+        if process.returncode != 0:
+            _raise_worker_failure(
+                result,
+                returncode=process.returncode,
+                stdout=stdout,
+                stderr=stderr,
+            )
+        if result is None or result.get("status") != "READY":
+            raise AssetPrepareError(
+                "BLENDER_SUPPLEMENTAL_FAILED: worker did not return a READY result"
+            )
+        if (
+            result.get("prepareId") != prepare_id
+            or result.get("view") != view
+            or Path(str(result.get("previewPath") or "")).resolve() != output
+            or not output.is_file()
+        ):
+            raise AssetPrepareError(
+                "BLENDER_SUPPLEMENTAL_RESULT_INVALID: worker result does not match the requested view"
+            )
+
+        total_ms = (time.perf_counter() - total_started) * 1000.0
+        timings = result.get("timings") if isinstance(result.get("timings"), dict) else {}
+        public_timings = dict(timings)
+        public_timings["processSpawnMs"] = round(process_spawn_ms, 3)
+        public_timings["totalMs"] = round(
+            max(float(public_timings.get("totalMs", 0.0)), total_ms), 3
+        )
+        return public_timings
+    finally:
+        for transient in (job_path, result_path):
+            try:
+                transient.unlink()
+            except FileNotFoundError:
+                pass

@@ -279,3 +279,134 @@ def test_prepare_cancellation_is_not_converted_into_a_normal_error(monkeypatch, 
                 profile="METADATA",
             )
         )
+
+
+def test_single_prepare_uses_server_global_asset_worker_slot(monkeypatch, tmp_path: Path):
+    from contextlib import asynccontextmanager
+
+    source = tmp_path / "asset.blend"
+    source.write_bytes(b"BLENDER-source")
+    ready, preview_path = _ready_result(tmp_path)
+    events = []
+
+    @asynccontextmanager
+    async def fake_slot():
+        events.append("enter")
+        try:
+            yield
+        finally:
+            events.append("exit")
+
+    def fake_prepare(*_args, **_kwargs):
+        events.append("prepare")
+        return ready
+
+    monkeypatch.setattr(server, "asset_worker_slot", fake_slot, raising=False)
+    monkeypatch.setattr(server, "prepare_blend_file", fake_prepare)
+    monkeypatch.setattr(
+        server,
+        "get_prepared_artifact_store",
+        lambda: _FakeArtifactStore(preview_path),
+    )
+
+    result = _call_tool(
+        {"source": {"kind": "BLEND_FILE", "path": str(source)}, "profile": "METADATA"}
+    )
+
+    assert result.isError is False
+    assert events == ["enter", "prepare", "exit"]
+
+
+def test_prepare_uses_local_addon_runtime_resolution(monkeypatch, tmp_path: Path):
+    from types import SimpleNamespace
+
+    source = tmp_path / "asset.blend"
+    source.write_bytes(b"BLENDER-source")
+    ready, preview_path = _ready_result(tmp_path)
+    runtime = object()
+    resolved = []
+    prepare_runtimes = []
+
+    monkeypatch.setattr(
+        server,
+        "_addon_handshake",
+        SimpleNamespace(blender_binary_path="C:/Program Files/Blender/blender.exe"),
+    )
+    monkeypatch.setenv("BLENDER_HOST", "127.0.0.1")
+
+    def fake_resolve_blender_runtime(**kwargs):
+        resolved.append(kwargs)
+        return runtime
+
+    def fake_prepare(*_args, **kwargs):
+        prepare_runtimes.append(kwargs.get("runtime"))
+        return ready
+
+    monkeypatch.setattr(server, "resolve_blender_runtime", fake_resolve_blender_runtime)
+    monkeypatch.setattr(server, "prepare_blend_file", fake_prepare)
+    monkeypatch.setattr(
+        server,
+        "get_prepared_artifact_store",
+        lambda: _FakeArtifactStore(preview_path),
+    )
+
+    result = _call_tool(
+        {"source": {"kind": "BLEND_FILE", "path": str(source)}, "profile": "METADATA"}
+    )
+
+    assert result.isError is False
+    assert resolved == [
+        {
+            "addon_binary_path": "C:/Program Files/Blender/blender.exe",
+            "blender_host": "127.0.0.1",
+        }
+    ]
+    assert prepare_runtimes == [runtime]
+
+
+def test_supplemental_renderer_uses_local_addon_runtime_resolution(monkeypatch, tmp_path: Path):
+    from types import SimpleNamespace
+
+    source = tmp_path / "retained.blend"
+    source.write_bytes(b"BLENDER-retained")
+    output = tmp_path / "front.png"
+    runtime = object()
+    resolved = []
+    render_runtimes = []
+
+    monkeypatch.setattr(
+        server,
+        "_addon_handshake",
+        SimpleNamespace(blender_binary_path="C:/Program Files/Blender/blender.exe"),
+    )
+    monkeypatch.setenv("BLENDER_HOST", "localhost")
+
+    def fake_resolve_blender_runtime(**kwargs):
+        resolved.append(kwargs)
+        return runtime
+
+    async def fake_render_supplemental_view(**kwargs):
+        render_runtimes.append(kwargs.get("runtime"))
+        output.write_bytes(b"\x89PNG\r\n\x1a\nfront")
+        return {"totalMs": 1.0}
+
+    monkeypatch.setattr(server, "resolve_blender_runtime", fake_resolve_blender_runtime)
+    monkeypatch.setattr(server, "render_supplemental_view", fake_render_supplemental_view)
+
+    timings = asyncio.run(
+        server._render_prepared_supplemental_view(
+            source_path=source,
+            output_path=output,
+            view="FRONT",
+            prepare_id="prepare-runtime",
+        )
+    )
+
+    assert timings == {"totalMs": 1.0}
+    assert resolved == [
+        {
+            "addon_binary_path": "C:/Program Files/Blender/blender.exe",
+            "blender_host": "localhost",
+        }
+    ]
+    assert render_runtimes == [runtime]

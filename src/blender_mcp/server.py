@@ -38,9 +38,12 @@ from .blender_runtime import (
 )
 from .asset_pipeline import (
     AssetPrepareError,
+    asset_worker_slot,
     get_prepared_artifact_store,
     prepare_blend_file,
+    render_supplemental_view,
 )
+from .prepared_observation import PreparedObservationError, PreparedObservationService
 
 # Configure logging
 logging.basicConfig(level=logging.INFO,
@@ -54,6 +57,8 @@ DEFAULT_PORT = 9876
 _addon_handshake = None
 _addon_handshake_checked = False
 _addon_handshake_lock = threading.Lock()
+_prepared_observation_service: PreparedObservationService | None = None
+_prepared_observation_service_lock = threading.Lock()
 
 @dataclass
 class BlenderConnection:
@@ -396,25 +401,28 @@ async def get_addon_status(ctx: Context, user_prompt: str = "") -> str:
         return f"Error checking addon status: {e}"
 
 
+def _resolve_server_asset_runtime():
+    """Resolve background Blender using the server's current local Add-on handshake."""
+
+    with _addon_handshake_lock:
+        handshake = _addon_handshake
+    addon_binary_path = handshake.blender_binary_path if handshake is not None else None
+    try:
+        return resolve_blender_runtime(
+            addon_binary_path=addon_binary_path,
+            blender_host=os.getenv("BLENDER_HOST", DEFAULT_HOST),
+        )
+    except FileNotFoundError:
+        return None
+
+
 @mcp.tool()
 def get_asset_pipeline_status() -> str:
     """Report local background asset-pipeline capability without touching Blender GUI."""
     cpu_count = os.cpu_count()
     with _addon_handshake_lock:
         handshake = _addon_handshake
-    addon_binary_path = (
-        handshake.blender_binary_path if handshake is not None else None
-    )
-    blender_host = os.getenv("BLENDER_HOST", DEFAULT_HOST)
-
-    runtime = None
-    try:
-        runtime = resolve_blender_runtime(
-            addon_binary_path=addon_binary_path,
-            blender_host=blender_host,
-        )
-    except FileNotFoundError:
-        pass
+    runtime = _resolve_server_asset_runtime()
 
     recommended = recommended_asset_concurrency(cpu_count)
     configured = configured_asset_concurrency(cpu_count)
@@ -464,6 +472,26 @@ def _stable_prepare_error(exc: Exception, default_code: str) -> CallToolResult:
     ):
         return _prepare_blend_asset_error(prefix, detail.strip() or message)
     return _prepare_blend_asset_error(default_code, message)
+
+
+async def _render_prepared_supplemental_view(**kwargs):
+    return await render_supplemental_view(
+        runtime=_resolve_server_asset_runtime(),
+        **kwargs,
+    )
+
+
+def get_prepared_observation_service() -> PreparedObservationService:
+    """Return the process-wide prepared observation service used across MCP calls."""
+
+    global _prepared_observation_service
+    if _prepared_observation_service is None:
+        with _prepared_observation_service_lock:
+            if _prepared_observation_service is None:
+                _prepared_observation_service = PreparedObservationService(
+                    get_prepared_artifact_store(), renderer=_render_prepared_supplemental_view
+                )
+    return _prepared_observation_service
 
 
 def _validate_prepare_source(source: Dict[str, Any]) -> tuple[str, Path | None]:
@@ -665,14 +693,17 @@ async def prepare_blend_asset(
                 f"profile must be one of {', '.join(SUPPORTED_ASSET_PROFILES)}",
             )
         _validate_prepare_overrides(overrides)
+        runtime = _resolve_server_asset_runtime()
 
         if source_kind == "BLEND_FILE":
-            prepared = await asyncio.to_thread(
-                prepare_blend_file,
-                source_path,
-                profile=profile,
-                source_kind="BLEND_FILE",
-            )
+            async with asset_worker_slot():
+                prepared = await asyncio.to_thread(
+                    prepare_blend_file,
+                    source_path,
+                    profile=profile,
+                    source_kind="BLEND_FILE",
+                    runtime=runtime,
+                )
             return _prepare_blend_asset_content(prepared, profile)
 
         with tempfile.TemporaryDirectory(prefix="blendermcp-selection-") as snapshot_dir:
@@ -688,12 +719,14 @@ async def prepare_blend_asset(
                     "CURRENT_SELECTION_SHARED_FILESYSTEM_REQUIRED",
                     "selection snapshot is not visible to the Blender MCP server filesystem",
                 )
-            prepared = await asyncio.to_thread(
-                prepare_blend_file,
-                snapshot_path,
-                profile=profile,
-                source_kind="CURRENT_SELECTION",
-            )
+            async with asset_worker_slot():
+                prepared = await asyncio.to_thread(
+                    prepare_blend_file,
+                    snapshot_path,
+                    profile=profile,
+                    source_kind="CURRENT_SELECTION",
+                    runtime=runtime,
+                )
             return _prepare_blend_asset_content(prepared, profile)
     except _PrepareBlendAssetInputError as exc:
         return _prepare_blend_asset_error(exc.code, exc.message)
@@ -706,6 +739,86 @@ async def prepare_blend_asset(
     except Exception as exc:
         logger.exception("prepare_blend_asset failed")
         return _stable_prepare_error(exc, "BLENDER_PREPARE_FAILED")
+
+
+@mcp.tool()
+def inspect_prepared_asset(
+    prepare_id: str,
+    section: str,
+    cursor: str | None = None,
+    limit: int = 20,
+) -> CallToolResult:
+    """Page through cached prepared facts without reopening Blender or the GUI socket."""
+
+    try:
+        result = get_prepared_observation_service().inspect(
+            prepare_id,
+            section,
+            cursor=cursor,
+            limit=limit,
+        )
+        label = str(result.get("itemKey") or prepare_id)
+        bounded = result.get("boundedDetails") if isinstance(result.get("boundedDetails"), dict) else {}
+        items = bounded.get("items") if isinstance(bounded.get("items"), list) else []
+        total_count = bounded.get("totalCount")
+        summary = (
+            f"Prepared asset {label} {section}: returned {len(items)}"
+            + (f" of {total_count}" if isinstance(total_count, int) else "")
+            + " cached detail item(s)."
+        )
+        return CallToolResult(
+            content=[TextContent(type="text", text=summary)],
+            structuredContent=result,
+            isError=False,
+        )
+    except PreparedObservationError as exc:
+        return _prepare_blend_asset_error(exc.code, exc.message)
+    except Exception as exc:
+        logger.exception("inspect_prepared_asset failed")
+        return _stable_prepare_error(exc, "PREPARED_OBSERVATION_FAILED")
+
+
+@mcp.tool()
+async def render_prepared_asset_view(
+    prepare_id: str,
+    view: str,
+    idempotency_key: str,
+) -> CallToolResult:
+    """Render one supplemental axis view from retained immutable prepared evidence."""
+
+    try:
+        result = await get_prepared_observation_service().render(
+            prepare_id,
+            view,
+            idempotency_key,
+        )
+        artifact = result.get("supplementalArtifact")
+        if not isinstance(artifact, dict) or not isinstance(artifact.get("artifactId"), str):
+            raise AssetPrepareError(
+                "BLENDER_SUPPLEMENTAL_RESULT_INVALID: supplemental artifact reference is missing"
+            )
+        preview_path = get_prepared_artifact_store().resolve(artifact["artifactId"])
+        label = str(result.get("itemKey") or prepare_id)
+        summary = f"Prepared asset {label} supplemental view {view} is ready."
+        return CallToolResult(
+            content=[
+                TextContent(type="text", text=summary),
+                Image(path=preview_path, format="png").to_image_content(),
+            ],
+            structuredContent=result,
+            isError=False,
+        )
+    except PreparedObservationError as exc:
+        return _prepare_blend_asset_error(exc.code, exc.message)
+    except AssetPrepareError as exc:
+        return _stable_prepare_error(exc, "BLENDER_SUPPLEMENTAL_FAILED")
+    except FileNotFoundError as exc:
+        return _stable_prepare_error(exc, "PREPARED_ARTIFACT_NOT_FOUND")
+    except ValueError as exc:
+        return _stable_prepare_error(exc, "BLENDER_SUPPLEMENTAL_INVALID")
+    except Exception as exc:
+        logger.exception("render_prepared_asset_view failed")
+        return _stable_prepare_error(exc, "BLENDER_SUPPLEMENTAL_FAILED")
 
 
 @mcp.tool()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import subprocess
@@ -91,6 +92,20 @@ def test_asset_pipeline_spawns_packaged_worker_and_adds_process_timing(
             job_path = Path(commands[0][-1])
             job = json.loads(job_path.read_text(encoding="utf-8"))
             Path(job["previewPath"]).write_bytes(b"\x89PNG\r\n\x1a\npreview")
+            Path(job["observationCachePath"]).write_text(
+                json.dumps(
+                    {
+                        "prepareId": job["prepareId"],
+                        "sections": {
+                            "STRUCTURE": {"objects": {"items": []}},
+                            "GEOMETRY": {},
+                            "MATERIALS": {"items": {"items": []}},
+                            "DEFORMATION": {},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
             Path(job["resultPath"]).write_text(
                 json.dumps(
                     {
@@ -224,6 +239,20 @@ def test_asset_pipeline_registers_preview_and_retains_immutable_source_snapshot(
             job_path = Path(self.command[-1])
             job = json.loads(job_path.read_text(encoding="utf-8"))
             Path(job["previewPath"]).write_bytes(b"\x89PNG\r\n\x1a\npreview")
+            Path(job["observationCachePath"]).write_text(
+                json.dumps(
+                    {
+                        "prepareId": job["prepareId"],
+                        "sections": {
+                            "STRUCTURE": {"objectCount": 1, "objects": {"items": []}},
+                            "GEOMETRY": {"triangleCount": 1},
+                            "MATERIALS": {"items": {"items": []}},
+                            "DEFORMATION": {"hasArmature": False},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
             Path(job["resultPath"]).write_text(
                 json.dumps(
                     {
@@ -261,9 +290,149 @@ def test_asset_pipeline_registers_preview_and_retains_immutable_source_snapshot(
     assert store.resolve(preview_ref["artifact_id"]).read_bytes().startswith(b"\x89PNG")
     retained = store.retained_source_path(result["prepareId"])
     assert retained.read_bytes() == source_bytes
+    observation_cache = store.observation_cache_path(result["prepareId"])
+    assert observation_cache.name == "observation-cache.json"
+    assert json.loads(observation_cache.read_text(encoding="utf-8"))["prepareId"] == result["prepareId"]
 
     source.write_bytes(b"BLENDER-source-changed-after-prepare")
     assert retained.read_bytes() == source_bytes
+
+
+def test_async_supplemental_render_uses_shared_worker_slot_and_worker_mode(monkeypatch, tmp_path: Path):
+    from contextlib import asynccontextmanager
+    from blender_mcp import asset_pipeline
+
+    source = tmp_path / "retained.blend"
+    source.write_bytes(b"BLENDER-retained")
+    output = tmp_path / "front.png"
+    events = []
+
+    @asynccontextmanager
+    async def fake_slot():
+        events.append("enter")
+        try:
+            yield
+        finally:
+            events.append("exit")
+
+    class FakeProcess:
+        returncode = 0
+
+        def __init__(self, command):
+            self.command = command
+
+        async def communicate(self):
+            events.append("communicate")
+            job_path = Path(self.command[-1])
+            job = json.loads(job_path.read_text(encoding="utf-8"))
+            assert job["mode"] == "SUPPLEMENTAL_VIEW"
+            assert job["prepareId"] == "prepare-supplemental"
+            assert job["sourcePath"] == str(source)
+            assert job["previewPath"] == str(output)
+            assert job["view"] == "FRONT"
+            output.write_bytes(b"\x89PNG\r\n\x1a\nfront")
+            Path(job["resultPath"]).write_text(
+                json.dumps(
+                    {
+                        "status": "READY",
+                        "prepareId": job["prepareId"],
+                        "view": job["view"],
+                        "previewPath": job["previewPath"],
+                        "timings": {"openMs": 1.0, "renderMs": 2.0, "totalMs": 3.0},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return (b"worker stdout", b"")
+
+        def kill(self):
+            events.append("kill")
+
+    async def fake_create_subprocess_exec(*command, **kwargs):
+        events.append("spawn")
+        assert kwargs["stdout"] is asyncio.subprocess.PIPE
+        assert kwargs["stderr"] is asyncio.subprocess.PIPE
+        return FakeProcess(command)
+
+    monkeypatch.setattr(asset_pipeline, "asset_worker_slot", fake_slot, raising=False)
+    monkeypatch.setattr(asset_pipeline.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    timings = asyncio.run(
+        asset_pipeline.render_supplemental_view(
+            source_path=source,
+            output_path=output,
+            view="FRONT",
+            prepare_id="prepare-supplemental",
+            runtime=BlenderRuntime("C:/Blender/blender.exe", "ENV"),
+        )
+    )
+
+    assert output.read_bytes().startswith(b"\x89PNG")
+    assert set(("openMs", "renderMs", "processSpawnMs", "totalMs")).issubset(timings)
+    assert events == ["enter", "spawn", "communicate", "exit"]
+
+
+def test_async_supplemental_render_cancellation_kills_process_and_releases_slot(monkeypatch, tmp_path: Path):
+    from contextlib import asynccontextmanager
+    from blender_mcp import asset_pipeline
+
+    source = tmp_path / "retained.blend"
+    source.write_bytes(b"BLENDER-retained")
+    output = tmp_path / "left.png"
+    events = []
+
+    @asynccontextmanager
+    async def fake_slot():
+        events.append("enter")
+        try:
+            yield
+        finally:
+            events.append("exit")
+
+    class FakeProcess:
+        def __init__(self):
+            self.returncode = None
+            self.communicate_calls = 0
+
+        async def communicate(self):
+            self.communicate_calls += 1
+            if self.communicate_calls == 1:
+                events.append("communicate")
+                await asyncio.Future()
+            events.append("drain")
+            return (b"", b"")
+
+        def kill(self):
+            events.append("kill")
+            self.returncode = -9
+
+    async def fake_create_subprocess_exec(*_command, **_kwargs):
+        events.append("spawn")
+        return FakeProcess()
+
+    async def scenario():
+        task = asyncio.create_task(
+            asset_pipeline.render_supplemental_view(
+                source_path=source,
+                output_path=output,
+                view="LEFT",
+                prepare_id="prepare-cancel",
+                runtime=BlenderRuntime("C:/Blender/blender.exe", "ENV"),
+            )
+        )
+        while "communicate" not in events:
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    monkeypatch.setattr(asset_pipeline, "asset_worker_slot", fake_slot, raising=False)
+    monkeypatch.setattr(asset_pipeline.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    asyncio.run(scenario())
+
+    assert events == ["enter", "spawn", "communicate", "kill", "drain", "exit"]
+    assert not output.exists()
 
 
 def test_publish_fact_comparison_rejects_payload_mismatch():
@@ -482,3 +651,79 @@ def test_publish_scale_normalization_rejects_non_unit_hierarchical_object():
         worker._apply_publish_object_scales(fake_bpy, [parent, child])
     assert exc_info.value.code == "PUBLISH_SCALE_NORMALIZATION_UNSUPPORTED"
     assert parent.scale == (2.0, 1.0, 1.0)
+
+
+def test_supplemental_view_job_opens_retained_source_once_and_skips_observation(monkeypatch, tmp_path: Path):
+    source = tmp_path / "retained.blend"
+    source.write_bytes(b"BLENDER-retained")
+    preview = tmp_path / "front.png"
+    result_path = tmp_path / "supplemental-result.json"
+    open_calls = []
+    render_calls = []
+
+    fake_bpy = types.SimpleNamespace(
+        ops=types.SimpleNamespace(
+            wm=types.SimpleNamespace(open_mainfile=lambda filepath: open_calls.append(filepath))
+        )
+    )
+    monkeypatch.setattr(worker, "_import_bpy", lambda: fake_bpy)
+    monkeypatch.setattr(
+        worker,
+        "extract_observation",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("supplemental render must not rerun observation extraction")
+        ),
+    )
+
+    def render_view(_bpy, output_path, view):
+        render_calls.append((Path(output_path), view))
+        Path(output_path).write_bytes(b"\x89PNG\r\n\x1a\nfront")
+        return {"width": 512, "height": 512, "view": view}
+
+    monkeypatch.setattr(worker, "render_preview_view", render_view, raising=False)
+
+    result = worker.run_job(
+        {
+            "mode": "SUPPLEMENTAL_VIEW",
+            "prepareId": "prepare-supplemental",
+            "sourcePath": str(source),
+            "previewPath": str(preview),
+            "resultPath": str(result_path),
+            "view": "FRONT",
+        }
+    )
+
+    assert open_calls == [str(source)]
+    assert render_calls == [(preview, "FRONT")]
+    assert result["status"] == "READY"
+    assert result["prepareId"] == "prepare-supplemental"
+    assert result["view"] == "FRONT"
+    assert result["previewPath"] == str(preview)
+    assert set(("openMs", "renderMs", "totalMs")).issubset(result["timings"])
+    assert json.loads(result_path.read_text(encoding="utf-8"))["view"] == "FRONT"
+
+
+def test_supplemental_worker_rejects_non_axis_view_before_open(monkeypatch, tmp_path: Path):
+    source = tmp_path / "retained.blend"
+    source.write_bytes(b"BLENDER-retained")
+    open_calls = []
+    fake_bpy = types.SimpleNamespace(
+        ops=types.SimpleNamespace(
+            wm=types.SimpleNamespace(open_mainfile=lambda filepath: open_calls.append(filepath))
+        )
+    )
+    monkeypatch.setattr(worker, "_import_bpy", lambda: fake_bpy)
+
+    with pytest.raises(ValueError, match="Unsupported supplemental view"):
+        worker.run_job(
+            {
+                "mode": "SUPPLEMENTAL_VIEW",
+                "prepareId": "prepare-bad-view",
+                "sourcePath": str(source),
+                "previewPath": str(tmp_path / "bad.png"),
+                "resultPath": str(tmp_path / "bad-result.json"),
+                "view": "BOTTOM",
+            }
+        )
+
+    assert open_calls == []

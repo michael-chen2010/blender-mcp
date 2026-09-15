@@ -14,6 +14,7 @@ import time
 from typing import Callable, Iterator, Literal
 
 ArtifactKind = Literal["PAYLOAD", "PREVIEW"]
+RetainedSourceKind = Literal["PAYLOAD", "SOURCE_SNAPSHOT"]
 _DEFAULT_TTL_SECONDS = 60 * 60
 
 
@@ -50,6 +51,12 @@ class _WorkspaceRecord:
     artifact_ids: set[str] = field(default_factory=set)
     lease_count: int = 0
     retained_source_path: Path | None = None
+    retained_source_kind: RetainedSourceKind | None = None
+    retained_source_size: int | None = None
+    retained_source_sha256: str | None = None
+    observation_cache_path: Path | None = None
+    observation_cache_size: int | None = None
+    observation_cache_sha256: str | None = None
 
 
 def _sha256_file(path: Path) -> str:
@@ -104,6 +111,8 @@ class PreparedArtifactStore:
         workspace: str | Path,
         *,
         retained_source_path: str | Path | None = None,
+        retained_source_kind: RetainedSourceKind = "SOURCE_SNAPSHOT",
+        observation_cache_path: str | Path | None = None,
     ) -> None:
         if not prepare_id:
             raise ValueError("prepare_id is required")
@@ -113,7 +122,12 @@ class PreparedArtifactStore:
                 "PREPARED_ARTIFACT_WORKSPACE_MISSING",
                 f"Prepare workspace does not exist for {prepare_id}",
             )
+        if retained_source_kind not in {"PAYLOAD", "SOURCE_SNAPSHOT"}:
+            raise ValueError("retained_source_kind must be PAYLOAD or SOURCE_SNAPSHOT")
+
         retained: Path | None = None
+        retained_size: int | None = None
+        retained_sha256: str | None = None
         if retained_source_path is not None:
             retained = Path(retained_source_path).resolve()
             if not retained.is_file() or not _inside(retained, resolved_workspace):
@@ -121,6 +135,21 @@ class PreparedArtifactStore:
                     "PREPARED_ARTIFACT_INVALID_PATH",
                     "Retained source must be a file inside the prepare workspace",
                 )
+            retained_size = retained.stat().st_size
+            retained_sha256 = _sha256_file(retained)
+
+        cache: Path | None = None
+        cache_size: int | None = None
+        cache_sha256: str | None = None
+        if observation_cache_path is not None:
+            cache = Path(observation_cache_path).resolve()
+            if not cache.is_file() or not _inside(cache, resolved_workspace):
+                raise PreparedArtifactError(
+                    "PREPARED_ARTIFACT_INVALID_PATH",
+                    "Observation cache must be a file inside the prepare workspace",
+                )
+            cache_size = cache.stat().st_size
+            cache_sha256 = _sha256_file(cache)
         with self._lock:
             if prepare_id in self._workspaces:
                 raise PreparedArtifactError(
@@ -131,6 +160,12 @@ class PreparedArtifactStore:
                 path=resolved_workspace,
                 expires_at_epoch=self._clock() + self._ttl_seconds,
                 retained_source_path=retained,
+                retained_source_kind=retained_source_kind if retained is not None else None,
+                retained_source_size=retained_size,
+                retained_source_sha256=retained_sha256,
+                observation_cache_path=cache,
+                observation_cache_size=cache_size,
+                observation_cache_sha256=cache_sha256,
             )
 
     def register_artifact(
@@ -213,41 +248,86 @@ class PreparedArtifactStore:
                 )
             return current_path
 
+    def _workspace_for_read(self, prepare_id: str) -> _WorkspaceRecord:
+        workspace = self._workspaces.get(prepare_id)
+        if workspace is None:
+            raise PreparedArtifactError(
+                "PREPARED_ARTIFACT_NOT_FOUND",
+                f"Unknown prepare workspace: {prepare_id}",
+            )
+        if self._clock() >= workspace.expires_at_epoch:
+            raise PreparedArtifactError(
+                "PREPARED_ARTIFACT_EXPIRED",
+                "Prepare workspace has expired",
+            )
+        return workspace
+
     def retained_source_path(self, prepare_id: str) -> Path:
         with self._lock:
-            workspace = self._workspaces.get(prepare_id)
-            if workspace is None:
-                raise PreparedArtifactError(
-                    "PREPARED_ARTIFACT_NOT_FOUND",
-                    f"Unknown prepare workspace: {prepare_id}",
-                )
-            if self._clock() >= workspace.expires_at_epoch:
-                raise PreparedArtifactError(
-                    "PREPARED_ARTIFACT_EXPIRED",
-                    "Prepare workspace has expired",
-                )
+            workspace = self._workspace_for_read(prepare_id)
             path = workspace.retained_source_path
             if path is None or not path.is_file() or not _inside(path.resolve(), workspace.path):
                 raise PreparedArtifactError(
                     "PREPARED_ARTIFACT_NOT_FOUND",
                     "Prepare workspace has no retained source snapshot",
                 )
-            return path.resolve()
+            resolved = path.resolve()
+            stat = resolved.stat()
+            if (
+                workspace.retained_source_size is None
+                or workspace.retained_source_sha256 is None
+                or stat.st_size != workspace.retained_source_size
+                or _sha256_file(resolved) != workspace.retained_source_sha256
+            ):
+                raise PreparedArtifactError(
+                    "PREPARED_ARTIFACT_CHECKSUM_MISMATCH",
+                    "Retained evidence bytes no longer match the registered identity",
+                )
+            return resolved
+
+    def evidence_identity(self, prepare_id: str) -> dict[str, str | int]:
+        with self._lock:
+            workspace = self._workspace_for_read(prepare_id)
+            path = self.retained_source_path(prepare_id)
+            if workspace.retained_source_kind is None:
+                raise PreparedArtifactError(
+                    "PREPARED_ARTIFACT_NOT_FOUND",
+                    "Prepare workspace has no retained evidence identity",
+                )
+            return {
+                "prepareId": prepare_id,
+                "kind": workspace.retained_source_kind,
+                "size": path.stat().st_size,
+                "sha256": workspace.retained_source_sha256 or _sha256_file(path),
+            }
+
+    def observation_cache_path(self, prepare_id: str) -> Path:
+        with self._lock:
+            workspace = self._workspace_for_read(prepare_id)
+            path = workspace.observation_cache_path
+            if path is None or not path.is_file() or not _inside(path.resolve(), workspace.path):
+                raise PreparedArtifactError(
+                    "PREPARED_ARTIFACT_NOT_FOUND",
+                    "Prepare workspace has no observation cache",
+                )
+            resolved = path.resolve()
+            stat = resolved.stat()
+            if (
+                workspace.observation_cache_size is None
+                or workspace.observation_cache_sha256 is None
+                or stat.st_size != workspace.observation_cache_size
+                or _sha256_file(resolved) != workspace.observation_cache_sha256
+            ):
+                raise PreparedArtifactError(
+                    "PREPARED_ARTIFACT_CHECKSUM_MISMATCH",
+                    "Observation cache bytes no longer match the registered identity",
+                )
+            return resolved
 
     @contextmanager
     def lease(self, prepare_id: str) -> Iterator[Path]:
         with self._lock:
-            workspace = self._workspaces.get(prepare_id)
-            if workspace is None:
-                raise PreparedArtifactError(
-                    "PREPARED_ARTIFACT_NOT_FOUND",
-                    f"Unknown prepare workspace: {prepare_id}",
-                )
-            if self._clock() >= workspace.expires_at_epoch:
-                raise PreparedArtifactError(
-                    "PREPARED_ARTIFACT_EXPIRED",
-                    "Prepare workspace has expired",
-                )
+            workspace = self._workspace_for_read(prepare_id)
             workspace.lease_count += 1
             path = workspace.path
         try:
