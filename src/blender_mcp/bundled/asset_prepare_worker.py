@@ -14,7 +14,7 @@ import time
 from typing import Any, Callable, Iterable
 
 SUPPORTED_PROFILES = ("PREVIEW", "METADATA", "PUBLISH")
-WORKER_PROTOCOL_VERSION = 2
+WORKER_PROTOCOL_VERSION = 3
 OBSERVATION_SCHEMA_VERSION = 1
 ANALYZER_VERSION = "blender-mcp-observation-v1"
 PREVIEW_PRESET_VERSION = "asset-preview-v1"
@@ -22,6 +22,15 @@ OBJECT_DETAIL_LIMIT = 50
 MATERIAL_DETAIL_LIMIT = 30
 PREVIEW_WIDTH = 512
 PREVIEW_HEIGHT = 512
+PUBLISH_DIMENSION_TOLERANCE_METERS = 1e-5
+
+
+class PublishValidationError(RuntimeError):
+    """Stable failure raised when a prepared publish payload is not trustworthy."""
+
+    def __init__(self, code: str, message: str):
+        self.code = code
+        super().__init__(message)
 
 _NON_PBR_SHADER_TYPES = {
     "BSDF_DIFFUSE",
@@ -596,35 +605,42 @@ def extract_observation(
     profile: str,
     object_detail_limit: int = OBJECT_DETAIL_LIMIT,
     material_detail_limit: int = MATERIAL_DETAIL_LIMIT,
+    objects: Iterable[Any] | None = None,
+    observation_scope: str = "SOURCE_ASSET",
+    source_display_name: str | None = None,
 ) -> dict[str, Any]:
-    """Extract deterministic SOURCE_ASSET facts before any preview rig exists."""
-    objects = sorted(list(bpy.data.objects), key=lambda obj: obj.name)
+    """Extract deterministic facts for either source or standardized publish scope."""
+    observed_objects = sorted(
+        list(bpy.data.objects) if objects is None else list(objects),
+        key=lambda obj: obj.name,
+    )
     scene = bpy.context.scene
     unit_settings = getattr(scene, "unit_settings", None)
     scale_length = float(getattr(unit_settings, "scale_length", 1.0) or 1.0)
     structure, geometry = summarize_objects(
-        objects,
+        observed_objects,
         scale_length=scale_length,
         detail_limit=object_detail_limit,
         mesh_inspector=_real_mesh_inspector(bpy),
     )
     structure["collectionCount"] = len(bpy.data.collections)
     materials, material_names = summarize_materials(
-        objects, detail_limit=material_detail_limit
+        observed_objects, detail_limit=material_detail_limit
     )
-    deformation = summarize_deformation(objects)
+    deformation = summarize_deformation(observed_objects)
     source = Path(source_path)
+    display_name = source_display_name or source.name
 
     return {
         "schemaVersion": OBSERVATION_SCHEMA_VERSION,
         "analyzerVersion": ANALYZER_VERSION,
         "prepareId": prepare_id,
         "profile": profile,
-        "observationScope": "SOURCE_ASSET",
+        "observationScope": observation_scope,
         "source": {
             "kind": source_kind,
-            "displayName": source.name,
-            "fileName": source.name,
+            "displayName": display_name,
+            "fileName": display_name,
             "sourceSize": source.stat().st_size,
             "sourceSha256": _file_sha256(source),
             "blenderVersion": bpy.app.version_string,
@@ -634,10 +650,212 @@ def extract_observation(
         "materials": materials,
         "deformation": deformation,
         "evidenceSummary": {
-            "objectNames": [obj.name for obj in objects],
+            "objectNames": [obj.name for obj in observed_objects],
             "materialNames": material_names,
         },
     }
+
+
+def _collection_objects(collection: Any) -> list[Any]:
+    all_objects = getattr(collection, "all_objects", None)
+    if all_objects is not None:
+        return _as_sequence(all_objects)
+    return _as_sequence(getattr(collection, "objects", None))
+
+
+def _publish_target_objects(bpy: Any) -> list[Any]:
+    """Resolve one intended asset closure without treating scene cameras/lights as content."""
+    root = bpy.data.collections.get("ASSET_ROOT")
+    if root is not None:
+        rooted = _collection_objects(root)
+        if rooted:
+            return sorted(rooted, key=lambda obj: obj.name)
+
+    asset_collections = [
+        collection
+        for collection in bpy.data.collections
+        if getattr(collection, "asset_data", None) is not None
+    ]
+    if len(asset_collections) == 1:
+        rooted = _collection_objects(asset_collections[0])
+        if rooted:
+            return sorted(rooted, key=lambda obj: obj.name)
+
+    asset_objects = [
+        obj for obj in bpy.data.objects if getattr(obj, "asset_data", None) is not None
+    ]
+    if len(asset_objects) == 1:
+        pending = [asset_objects[0]]
+        resolved: dict[int, Any] = {}
+        while pending:
+            obj = pending.pop(0)
+            if id(obj) in resolved:
+                continue
+            resolved[id(obj)] = obj
+            pending.extend(_as_sequence(getattr(obj, "children", None)))
+            for modifier in _as_sequence(getattr(obj, "modifiers", None)):
+                target = getattr(modifier, "object", None)
+                if target is not None:
+                    pending.append(target)
+            for constraint in _as_sequence(getattr(obj, "constraints", None)):
+                target = getattr(constraint, "target", None)
+                if target is not None:
+                    pending.append(target)
+        return sorted(resolved.values(), key=lambda obj: obj.name)
+
+    fallback = [
+        obj
+        for obj in bpy.data.objects
+        if obj.type not in {"CAMERA", "LIGHT"}
+        and not obj.name.startswith("__BLENDERMCP_PREVIEW")
+    ]
+    return sorted(fallback, key=lambda obj: obj.name)
+
+
+def _evaluated_bounds(bpy: Any, objects: Iterable[Any]) -> tuple[Any, Any] | None:
+    from mathutils import Vector  # type: ignore
+
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    points = []
+    for obj in objects:
+        if obj.type != "MESH":
+            continue
+        evaluated = obj.evaluated_get(depsgraph)
+        try:
+            mesh = evaluated.to_mesh()
+            points.extend(evaluated.matrix_world @ Vector(vertex.co) for vertex in mesh.vertices)
+        finally:
+            evaluated.to_mesh_clear()
+    if not points:
+        return None
+    low = Vector(tuple(min(point[index] for point in points) for index in range(3)))
+    high = Vector(tuple(max(point[index] for point in points) for index in range(3)))
+    return low, high
+
+
+def _is_unit_scale(obj: Any, *, tolerance: float = 1e-8) -> bool:
+    values = _as_sequence(getattr(obj, "scale", None))
+    return len(values) >= 3 and all(abs(float(values[index]) - 1.0) <= tolerance for index in range(3))
+
+
+def _has_deformation_or_animation(obj: Any) -> bool:
+    if str(getattr(obj, "type", "")) == "ARMATURE":
+        return True
+    for owner in (obj, getattr(obj, "data", None)):
+        if owner is not None and getattr(owner, "animation_data", None) is not None:
+            return True
+    data = getattr(obj, "data", None)
+    if getattr(data, "shape_keys", None) is not None:
+        return True
+    if any(
+        str(getattr(modifier, "type", "")) == "ARMATURE"
+        for modifier in _as_sequence(getattr(obj, "modifiers", None))
+    ):
+        return True
+    return bool(_as_sequence(getattr(obj, "constraints", None)))
+
+
+def _apply_publish_object_scales(bpy: Any, targets: list[Any]) -> None:
+    """Bake safe static Mesh scales into evaluated geometry and reject lossy cases."""
+    target_ids = {id(obj) for obj in targets}
+    for obj in targets:
+        if _is_unit_scale(obj):
+            continue
+        target_children = [
+            child
+            for child in _as_sequence(getattr(obj, "children", None))
+            if id(child) in target_ids
+        ]
+        if target_children:
+            raise PublishValidationError(
+                "PUBLISH_SCALE_NORMALIZATION_UNSUPPORTED",
+                f"Cannot safely apply non-unit scale on hierarchical object {obj.name!r}",
+            )
+        if _has_deformation_or_animation(obj):
+            raise PublishValidationError(
+                "PUBLISH_SCALE_NORMALIZATION_UNSUPPORTED",
+                f"Cannot safely apply non-unit scale on deforming or animated object {obj.name!r}",
+            )
+        if str(getattr(obj, "type", "")) == "EMPTY":
+            obj.scale = (1.0, 1.0, 1.0)
+            continue
+        if str(getattr(obj, "type", "")) != "MESH":
+            raise PublishValidationError(
+                "PUBLISH_SCALE_NORMALIZATION_UNSUPPORTED",
+                f"Cannot safely apply non-unit scale on {obj.type} object {obj.name!r}",
+            )
+
+        from mathutils import Matrix  # type: ignore
+
+        scale = tuple(float(value) for value in obj.scale)
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        evaluated = obj.evaluated_get(depsgraph)
+        try:
+            baked_mesh = bpy.data.meshes.new_from_object(
+                evaluated,
+                preserve_all_data_layers=True,
+                depsgraph=depsgraph,
+            )
+        except TypeError:
+            baked_mesh = bpy.data.meshes.new_from_object(evaluated, depsgraph=depsgraph)
+        baked_mesh.name = f"{obj.data.name}_PUBLISH"
+        baked_mesh.transform(Matrix.Diagonal((scale[0], scale[1], scale[2], 1.0)))
+        obj.data = baked_mesh
+        for modifier in list(obj.modifiers):
+            obj.modifiers.remove(modifier)
+        obj.scale = (1.0, 1.0, 1.0)
+
+
+def normalize_publish_context(bpy: Any) -> list[Any]:
+    """Isolate the publish closure, standardize metric scale and ASSET_ROOT entry."""
+    targets = _publish_target_objects(bpy)
+    if not targets:
+        raise PublishValidationError("PUBLISH_ASSET_EMPTY", "No publishable asset objects were found")
+    target_ids = {id(obj) for obj in targets}
+
+    for obj in list(bpy.data.objects):
+        if id(obj) not in target_ids:
+            bpy.data.objects.remove(obj, do_unlink=True)
+
+    scene = bpy.context.scene
+    root = bpy.data.collections.get("ASSET_ROOT")
+    created_root = root is None
+    if root is None:
+        root = bpy.data.collections.new("ASSET_ROOT")
+    if root.name not in {collection.name for collection in scene.collection.children}:
+        scene.collection.children.link(root)
+
+    if created_root:
+        for obj in targets:
+            for collection in list(obj.users_collection):
+                collection.objects.unlink(obj)
+            root.objects.link(obj)
+    for collection in list(scene.collection.children):
+        if collection != root:
+            scene.collection.children.unlink(collection)
+
+    unit_settings = scene.unit_settings
+    source_scale = float(getattr(unit_settings, "scale_length", 1.0) or 1.0)
+    top_level = [obj for obj in targets if getattr(obj, "parent", None) not in targets]
+    if source_scale != 1.0:
+        for obj in top_level:
+            obj.location = tuple(float(value) * source_scale for value in obj.location)
+            obj.scale = tuple(float(value) * source_scale for value in obj.scale)
+    unit_settings.system = "METRIC"
+    unit_settings.length_unit = "METERS"
+    unit_settings.scale_length = 1.0
+    _apply_publish_object_scales(bpy, targets)
+
+    bounds = _evaluated_bounds(bpy, targets)
+    if bounds is not None:
+        from mathutils import Vector  # type: ignore
+
+        low, high = bounds
+        offset = Vector((-(low.x + high.x) * 0.5, -(low.y + high.y) * 0.5, -low.z))
+        for obj in top_level:
+            obj.location = obj.location + offset
+
+    return sorted(targets, key=lambda obj: obj.name)
 
 
 def _preview_world_bounds(bpy: Any) -> tuple[Any, float]:
@@ -751,6 +969,118 @@ def render_main_preview(bpy: Any, observation: dict[str, Any], output_path: str)
     }
 
 
+def _remove_preview_rig(bpy: Any) -> None:
+    scene = bpy.context.scene
+    if getattr(scene, "camera", None) is not None and scene.camera.name.startswith(
+        "__BLENDERMCP_PREVIEW"
+    ):
+        scene.camera = None
+    for obj in list(bpy.data.objects):
+        if obj.name.startswith("__BLENDERMCP_PREVIEW"):
+            bpy.data.objects.remove(obj, do_unlink=True)
+    for collection in list(bpy.data.collections):
+        if collection.name.startswith("__BLENDERMCP_PREVIEW"):
+            bpy.data.collections.remove(collection)
+    world = getattr(scene, "world", None)
+    if world is not None and world.name.startswith("__BLENDERMCP_PREVIEW"):
+        scene.world = None
+        bpy.data.worlds.remove(world)
+
+
+def pack_self_contained(bpy: Any) -> dict[str, Any]:
+    libraries = [str(getattr(library, "filepath", "")) for library in bpy.data.libraries]
+    if libraries:
+        raise PublishValidationError(
+            "PAYLOAD_NOT_SELF_CONTAINED",
+            "Linked Blender libraries remain in the publish closure",
+        )
+    bpy.ops.file.pack_all()
+    unpacked_images = []
+    for image in bpy.data.images:
+        source = str(getattr(image, "source", ""))
+        if source not in {"FILE", "SEQUENCE", "MOVIE"}:
+            continue
+        packed = bool(getattr(image, "packed_file", None)) or bool(
+            _as_sequence(getattr(image, "packed_files", None))
+        )
+        if not packed:
+            unpacked_images.append(image.name)
+    if unpacked_images:
+        raise PublishValidationError(
+            "PAYLOAD_NOT_SELF_CONTAINED",
+            "Unpacked external images remain: " + ", ".join(sorted(unpacked_images)),
+        )
+    return {"selfContained": True, "linkedLibraryCount": 0, "unpackedImageCount": 0}
+
+
+def write_publish_payload(bpy: Any, payload_path: str | Path) -> None:
+    target = Path(payload_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    bpy.data.libraries.write(
+        str(target),
+        {bpy.context.scene},
+        path_remap="RELATIVE",
+        fake_user=True,
+        compress=False,
+    )
+    if not target.is_file():
+        raise PublishValidationError(
+            "PAYLOAD_WRITE_FAILED", "Blender library write did not create payload.blend"
+        )
+
+
+def compare_publish_facts(
+    expected: dict[str, Any],
+    reopened: dict[str, Any],
+    *,
+    dimension_tolerance: float = PUBLISH_DIMENSION_TOLERANCE_METERS,
+) -> dict[str, Any]:
+    mismatches: list[dict[str, Any]] = []
+    scalar_paths = (
+        ("structure", "objectCount"),
+        ("geometry", "triangleCount"),
+        ("materials", "materialCount"),
+        ("materials", "materialWorkflow"),
+    )
+    for section, key in scalar_paths:
+        before = expected.get(section, {}).get(key)
+        after = reopened.get(section, {}).get(key)
+        if before != after:
+            mismatches.append({"field": f"{section}.{key}", "expected": before, "actual": after})
+
+    expected_dimensions = expected.get("geometry", {}).get("dimensionsMeters", {})
+    reopened_dimensions = reopened.get("geometry", {}).get("dimensionsMeters", {})
+    for axis in ("x", "y", "z"):
+        before = float(expected_dimensions.get(axis, 0.0) or 0.0)
+        after = float(reopened_dimensions.get(axis, 0.0) or 0.0)
+        if abs(before - after) > dimension_tolerance:
+            mismatches.append(
+                {
+                    "field": f"geometry.dimensionsMeters.{axis}",
+                    "expected": before,
+                    "actual": after,
+                }
+            )
+    if mismatches:
+        raise PublishValidationError(
+            "PAYLOAD_FACT_MISMATCH",
+            "Final payload facts differ from prepared publish facts: "
+            + json.dumps(mismatches, ensure_ascii=False, sort_keys=True),
+        )
+    return {
+        "status": "PASSED",
+        "factsVerifiedAfterReopen": True,
+        "dimensionToleranceMeters": dimension_tolerance,
+        "verifiedFields": [
+            "structure.objectCount",
+            "geometry.triangleCount",
+            "geometry.dimensionsMeters",
+            "materials.materialCount",
+            "materials.materialWorkflow",
+        ],
+    }
+
+
 def _write_json(path: str | Path, payload: dict[str, Any]) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -767,7 +1097,9 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
     profile = str(job.get("profile") or "")
     source_path = str(job.get("sourcePath") or "")
     source_kind = str(job.get("sourceKind") or "BLEND_FILE")
+    source_display_name = str(job.get("sourceDisplayName") or Path(source_path).name)
     preview_path = str(job.get("previewPath") or "")
+    payload_path = str(job.get("payloadPath") or "")
     result_path = str(job.get("resultPath") or "")
 
     if not prepare_id:
@@ -778,6 +1110,8 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
         raise FileNotFoundError(f"job.sourcePath does not exist: {source_path}")
     if not preview_path:
         raise ValueError("job.previewPath is required")
+    if profile == "PUBLISH" and not payload_path:
+        raise ValueError("job.payloadPath is required for PUBLISH")
     if not result_path:
         raise ValueError("job.resultPath is required")
 
@@ -788,15 +1122,29 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
         bpy.ops.wm.open_mainfile(filepath=source_path)
         open_ms = _elapsed_ms(open_started)
 
+        publish_objects: list[Any] | None = None
+        if profile == "PUBLISH":
+            publish_objects = normalize_publish_context(bpy)
+
         inspect_started = time.perf_counter()
         observation = extract_observation(
             bpy,
             prepare_id=prepare_id,
             source_kind=source_kind,
             source_path=source_path,
+            source_display_name=source_display_name,
             profile=profile,
+            objects=publish_objects,
+            observation_scope="PUBLISH_PAYLOAD" if profile == "PUBLISH" else "SOURCE_ASSET",
         )
         inspect_ms = _elapsed_ms(inspect_started)
+
+        pack_ms = 0.0
+        pack_evidence: dict[str, Any] | None = None
+        if profile == "PUBLISH":
+            pack_started = time.perf_counter()
+            pack_evidence = pack_self_contained(bpy)
+            pack_ms = _elapsed_ms(pack_started)
 
         preview_started = time.perf_counter()
         preview_evidence = render_main_preview(bpy, observation, preview_path)
@@ -807,19 +1155,81 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
             "supplementalViews": [],
         }
 
-        result = {
+        timings = {
+            "openMs": open_ms,
+            "inspectMs": inspect_ms,
+            "previewMs": preview_ms,
+        }
+        result: dict[str, Any] = {
             "status": "READY",
             "prepareId": prepare_id,
             "profile": profile,
             "observation": observation,
             "previewPath": preview_path,
-            "timings": {
-                "openMs": open_ms,
-                "inspectMs": inspect_ms,
-                "previewMs": preview_ms,
-                "totalMs": _elapsed_ms(started),
-            },
         }
+
+        if profile == "PUBLISH":
+            _remove_preview_rig(bpy)
+            payload_write_started = time.perf_counter()
+            write_publish_payload(bpy, payload_path)
+            payload_write_ms = _elapsed_ms(payload_write_started)
+
+            payload_reopen_started = time.perf_counter()
+            bpy.ops.wm.open_mainfile(filepath=payload_path)
+            payload_reopen_ms = _elapsed_ms(payload_reopen_started)
+            root = bpy.data.collections.get("ASSET_ROOT")
+            if root is None:
+                raise PublishValidationError(
+                    "PAYLOAD_ENTRY_MISSING", "Final payload does not contain ASSET_ROOT"
+                )
+            reopened_objects = _collection_objects(root)
+            reopened_observation = extract_observation(
+                bpy,
+                prepare_id=prepare_id,
+                source_kind=source_kind,
+                source_path=source_path,
+                source_display_name=source_display_name,
+                profile=profile,
+                objects=reopened_objects,
+                observation_scope="PUBLISH_PAYLOAD",
+            )
+            validation = compare_publish_facts(
+                observation,
+                reopened_observation,
+                dimension_tolerance=PUBLISH_DIMENSION_TOLERANCE_METERS,
+            )
+            validation["entryType"] = "COLLECTION"
+            validation["entryName"] = "ASSET_ROOT"
+            validation["selfContained"] = bool(pack_evidence and pack_evidence["selfContained"])
+
+            hash_started = time.perf_counter()
+            payload_file = Path(payload_path)
+            payload_sha256 = _file_sha256(payload_file)
+            payload_size = payload_file.stat().st_size
+            hash_ms = _elapsed_ms(hash_started)
+            payload_evidence = {
+                "format": "BLEND",
+                "compression": "NONE",
+                "generatedBlenderVersion": bpy.app.version_string,
+                "sha256": payload_sha256,
+                "size": payload_size,
+                "factsVerifiedAfterReopen": True,
+            }
+            observation["payloadEvidence"] = payload_evidence
+            result["payloadPath"] = payload_path
+            result["payloadEvidence"] = payload_evidence
+            result["validation"] = validation
+            timings.update(
+                {
+                    "packMs": pack_ms,
+                    "payloadWriteMs": payload_write_ms,
+                    "payloadReopenMs": payload_reopen_ms,
+                    "hashMs": hash_ms,
+                }
+            )
+
+        timings["totalMs"] = _elapsed_ms(started)
+        result["timings"] = timings
         _write_json(result_path, result)
         return result
     except Exception as exc:
@@ -828,7 +1238,7 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
             "prepareId": prepare_id,
             "profile": profile,
             "error": {
-                "code": "WORKER_FAILED",
+                "code": exc.code if isinstance(exc, PublishValidationError) else "WORKER_FAILED",
                 "message": str(exc),
                 "type": type(exc).__name__,
             },
