@@ -249,6 +249,7 @@ def prepare_blend_file(
     spawn_started = time.perf_counter()
     process = subprocess.Popen(
         command,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,

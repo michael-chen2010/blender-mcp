@@ -124,6 +124,7 @@ def test_asset_pipeline_spawns_packaged_worker_and_adds_process_timing(
     def popen(command, **kwargs):
         commands.append(command)
         assert kwargs["text"] is True
+        assert kwargs["stdin"] is subprocess.DEVNULL
         return FakeProcess()
 
     monkeypatch.setattr(asset_pipeline.subprocess, "Popen", popen)
