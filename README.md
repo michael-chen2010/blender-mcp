@@ -94,7 +94,7 @@ See [MCP Client Setup](#mcp-client-setup) below for per-client instructions and 
 uvx blender-mcp install-addon
 ```
 
-Then in Blender: **Edit → Preferences → Add-ons** → enable **Interface: MCP for Blender**.
+Then in Blender: **Edit → Preferences → Add-ons** → enable **Interface: MCP for Blender**. Re-running `install-addon` updates a known existing MCP for Blender install in place (keeping a `.bak` when the bytes change); disable/re-enable the addon or restart Blender before reconnecting so Blender loads the new code.
 
 **4. Connect**
 
@@ -299,6 +299,9 @@ The following environment variables can be used to configure the Blender connect
 | `BLENDER_HOST` | `localhost` | Host address for Blender socket server |
 | `BLENDER_PORT` | `9876` | Port number for Blender socket server |
 | `BLENDER_MCP_SAFE_MODE` | off | Set to `1` to validate scripts before they run in Blender (see below) |
+| `BLENDERMCP_BLENDER_EXECUTABLE` | auto | Absolute local Blender executable used by the background asset pipeline. When set, this path is authoritative and must exist. |
+| `BLENDERMCP_ASSET_MAX_CONCURRENCY` | CPU-derived | Global background asset-worker limit. Default is half the logical CPUs, at least 1 and capped at 12; configured values are also clamped to 1–12. |
+| `BLENDERMCP_ADDONS_DIR` | auto | Blender user `scripts/addons` directory used by addon discovery/install. `BLENDER_USER_ADDONS` is accepted as the legacy/alternate override. |
 
 Example:
 
@@ -306,6 +309,16 @@ Example:
 export BLENDER_HOST='host.docker.internal'
 export BLENDER_PORT=9876
 ```
+
+#### Background asset pipeline
+
+`prepare_blend_asset` and the batch preparation tools run asset analysis/rendering in isolated background Blender processes. The executable is resolved in this order: `BLENDERMCP_BLENDER_EXECUTABLE` → a **local** connected addon's `bpy.app.binary_path` → `blender` on `PATH`. A binary path reported by a remote Blender host is intentionally ignored because it is not guaranteed to exist on the MCP server machine.
+
+Use `get_asset_pipeline_status` before a long import to inspect the effective capability. It reports `available`, runtime `source` (`ENV`, `LOCAL_ADDON`, or `PATH`), the local addon Blender version when known, supported `PREVIEW` / `METADATA` / `PUBLISH` profiles, CPU count, recommended concurrency, configured concurrency, and the hard cap of 12. `BLEND_FILE` sources stay entirely in the background pipeline; `CURRENT_SELECTION` takes one `ASSET_CLOSURE` snapshot from the connected Blender and then performs the same background work, so preparation does not strip lights/cameras or otherwise rewrite the open scene.
+
+For directories, `discover_blend_files` returns a deterministic fingerprinted manifest and `start_prepare_blend_assets` / `get_prepare_blend_assets` expose item-level progress. One corrupt file fails only that item; ready siblings remain usable. Prepared artifacts are opaque, expiring handles. `inspect_prepared_asset` reads cached immutable observations, `render_prepared_asset_view` renders a supplemental view from retained evidence, and upload tools stream those registered artifacts to caller-provided signed URLs rather than exposing arbitrary local paths.
+
+`uvx blender-mcp install-addon` is an explicit write operation: startup status checks only report missing/outdated addon installs and never overwrite them automatically. The installer prefers an existing MCP for Blender installation when one is found; otherwise it uses the first discovered Blender user addon directory. Set `BLENDERMCP_ADDONS_DIR` when auto-discovery does not point at the Blender version you intend to use.
 
 #### Safe mode
 
