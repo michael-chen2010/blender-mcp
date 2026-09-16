@@ -386,6 +386,7 @@ async def render_supplemental_view(
             spawn_started = time.perf_counter()
             process = await asyncio.create_subprocess_exec(
                 *command,
+                stdin=subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )

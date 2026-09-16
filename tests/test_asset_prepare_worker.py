@@ -351,6 +351,7 @@ def test_async_supplemental_render_uses_shared_worker_slot_and_worker_mode(monke
 
     async def fake_create_subprocess_exec(*command, **kwargs):
         events.append("spawn")
+        assert kwargs["stdin"] is subprocess.DEVNULL
         assert kwargs["stdout"] is asyncio.subprocess.PIPE
         assert kwargs["stderr"] is asyncio.subprocess.PIPE
         return FakeProcess(command)
