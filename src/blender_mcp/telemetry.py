@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from enum import Enum
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -70,9 +71,17 @@ class TelemetryCollector:
 
     def __init__(self):
         """Initialize telemetry collector"""
-        # Import config here to avoid circular imports
-        from .config import telemetry_config
-        self.config = telemetry_config
+        # Private credentials are intentionally gitignored and may be absent in
+        # source installs and wheels. No config must mean no data transmission.
+        try:
+            from .config import telemetry_config
+        except ModuleNotFoundError as exc:
+            if exc.name != f"{__package__}.config":
+                raise
+            self.config = SimpleNamespace(enabled=False)
+            logger.warning("Private telemetry config missing; telemetry disabled")
+        else:
+            self.config = telemetry_config
 
         # Check if disabled via environment variables
         if self._is_disabled():

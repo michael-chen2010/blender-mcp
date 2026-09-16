@@ -136,7 +136,7 @@ def _apply_consent(consent: bool) -> bool:
     """Write consent to Blender and refresh the cached value."""
     try:
         from .server import get_blender_connection
-        from .telemetry import telemetry
+        from .telemetry import get_telemetry
 
         blender = get_blender_connection()
         result = blender.send_command(
@@ -145,7 +145,7 @@ def _apply_consent(consent: bool) -> bool:
         if "error" in result:
             logger.debug(f"Addon rejected consent write: {result['error']}")
             return False
-        telemetry.invalidate_consent_cache()
+        get_telemetry().invalidate_consent_cache()
         return True
     except Exception as e:
         logger.debug(f"Could not set telemetry consent: {e}")
