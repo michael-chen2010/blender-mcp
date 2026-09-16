@@ -320,6 +320,16 @@ For directories, `discover_blend_files` returns a deterministic fingerprinted ma
 
 `uvx blender-mcp install-addon` is an explicit write operation: startup status checks only report missing/outdated addon installs and never overwrite them automatically. The installer prefers an existing MCP for Blender installation when one is found; otherwise it uses the first discovered Blender user addon directory. Set `BLENDERMCP_ADDONS_DIR` when auto-discovery does not point at the Blender version you intend to use.
 
+**Running a modified source checkout (Windows / PowerShell):** use the same checkout for both the executable MCP server and the addon installation. Replace the example path with your repository's absolute path; the single quotes *inside* `--mcp-command` prevent the outer command parser from swallowing the `uvx --from` value.
+
+```powershell
+uvx --from 'E:\Work\blender-mcp' blender-mcp install-addon
+# If a tunnel client wraps the server command, give it this complete command string:
+# --mcp-command "uvx --from 'E:\Work\blender-mcp' blender-mcp"
+```
+
+Restart the tunnel client/server after source updates; disable/re-enable the addon or restart Blender after `install-addon`. `get_addon_status` should report matching `protocol_version` and `expected_protocol_version` (currently both 6); `get_asset_pipeline_status` independently verifies background preparation. A connected GUI/addon is required for `CURRENT_SELECTION` and `execute_blender_code`, but not for background `BLEND_FILE` preparation. The background subprocesses run with independent stdio and must not inherit the MCP protocol stdin. For a multi-item import, reuse `batchPrepareId` and each `itemKey` when polling/retrying; do not rediscover or reprepare READY siblings. Cached inspect and supplemental renders operate on retained immutable evidence, not on a source `.blend` that may have changed since preparation. `PUBLISH` extracts formal geometry/material facts from the reopened Payload; the supplemental preview does not replace the formal MAIN preview.
+
 #### Safe mode
 
 By default, the AI can run any Python code in Blender. Set `BLENDER_MCP_SAFE_MODE=1` to check every script before it runs and block risky code — things like reading or writing files directly, running other programs, accessing the network, or installing code that keeps running after the script ends. Normal Blender work (modeling, materials, rendering, saving, import/export) still works. Blocked scripts are sent back to the AI with the reason, so it can try again with a corrected version.
