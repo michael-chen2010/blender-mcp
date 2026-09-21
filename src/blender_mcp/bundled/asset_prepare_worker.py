@@ -757,28 +757,34 @@ def _has_deformation_or_animation(obj: Any) -> bool:
 
 
 def _apply_publish_object_scales(bpy: Any, targets: list[Any]) -> None:
-    """Bake safe static Mesh scales into evaluated geometry and reject lossy cases."""
+    """Normalize safe static scales while preserving hierarchy and deforming source transforms."""
     target_ids = {id(obj) for obj in targets}
     for obj in targets:
         if _is_unit_scale(obj):
             continue
+
+        # Applying scale to Armatures, animated objects, constrained objects, shape-key
+        # meshes, or Armature-deformed meshes can alter the evaluated animation/rig.
+        # Keeping their authored object transforms is lossless and the publish payload
+        # is verified after reopen, so preserve those source scales instead of failing.
+        if _has_deformation_or_animation(obj):
+            continue
+
         target_children = [
             child
             for child in _as_sequence(getattr(obj, "children", None))
             if id(child) in target_ids
         ]
-        if target_children:
-            raise PublishValidationError(
-                "PUBLISH_SCALE_NORMALIZATION_UNSUPPORTED",
-                f"Cannot safely apply non-unit scale on hierarchical object {obj.name!r}",
-            )
-        if _has_deformation_or_animation(obj):
-            raise PublishValidationError(
-                "PUBLISH_SCALE_NORMALIZATION_UNSUPPORTED",
-                f"Cannot safely apply non-unit scale on deforming or animated object {obj.name!r}",
-            )
+        child_world_matrices = [
+            (child, child.matrix_world.copy())
+            for child in target_children
+            if getattr(child, "matrix_world", None) is not None
+        ]
+
         if str(getattr(obj, "type", "")) == "EMPTY":
             obj.scale = (1.0, 1.0, 1.0)
+            for child, matrix_world in child_world_matrices:
+                child.matrix_world = matrix_world
             continue
         if str(getattr(obj, "type", "")) != "MESH":
             raise PublishValidationError(
@@ -805,6 +811,8 @@ def _apply_publish_object_scales(bpy: Any, targets: list[Any]) -> None:
         for modifier in list(obj.modifiers):
             obj.modifiers.remove(modifier)
         obj.scale = (1.0, 1.0, 1.0)
+        for child, matrix_world in child_world_matrices:
+            child.matrix_world = matrix_world
 
 
 def normalize_publish_context(bpy: Any) -> list[Any]:

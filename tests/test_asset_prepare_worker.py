@@ -713,20 +713,54 @@ def test_pack_self_contained_rejects_linked_blender_library():
     assert exc_info.value.code == "PAYLOAD_NOT_SELF_CONTAINED"
 
 
-def test_publish_scale_normalization_rejects_non_unit_hierarchical_object():
-    child = types.SimpleNamespace(name="Child", scale=(1.0, 1.0, 1.0), children=[])
+def test_publish_scale_normalization_handles_static_hierarchical_empty_without_moving_child_world():
+    child = types.SimpleNamespace(
+        name="Child",
+        type="MESH",
+        scale=(1.0, 1.0, 1.0),
+        children=[],
+        matrix_world=["child-world"],
+    )
     parent = types.SimpleNamespace(
         name="ScaledParent",
-        type="MESH",
+        type="EMPTY",
         scale=(2.0, 1.0, 1.0),
         children=[child],
     )
     fake_bpy = types.SimpleNamespace()
 
-    with pytest.raises(worker.PublishValidationError) as exc_info:
-        worker._apply_publish_object_scales(fake_bpy, [parent, child])
-    assert exc_info.value.code == "PUBLISH_SCALE_NORMALIZATION_UNSUPPORTED"
-    assert parent.scale == (2.0, 1.0, 1.0)
+    worker._apply_publish_object_scales(fake_bpy, [parent, child])
+
+    assert parent.scale == (1.0, 1.0, 1.0)
+    assert child.matrix_world == ["child-world"]
+
+
+def test_publish_scale_normalization_preserves_deforming_hierarchy_source_scales():
+    child = types.SimpleNamespace(
+        name="model",
+        type="MESH",
+        scale=(100.0, 100.0, 100.0),
+        children=[],
+        modifiers=[types.SimpleNamespace(type="ARMATURE")],
+        constraints=[],
+        data=types.SimpleNamespace(animation_data=None, shape_keys=None),
+    )
+    parent = types.SimpleNamespace(
+        name="Armature",
+        type="ARMATURE",
+        scale=(0.01, 0.01, 0.01),
+        children=[child],
+        modifiers=[],
+        constraints=[],
+        animation_data=object(),
+        data=types.SimpleNamespace(animation_data=None),
+    )
+    fake_bpy = types.SimpleNamespace()
+
+    worker._apply_publish_object_scales(fake_bpy, [parent, child])
+
+    assert parent.scale == (0.01, 0.01, 0.01)
+    assert child.scale == (100.0, 100.0, 100.0)
 
 
 def test_supplemental_view_job_opens_retained_source_once_and_skips_observation(monkeypatch, tmp_path: Path):
