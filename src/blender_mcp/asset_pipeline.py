@@ -546,7 +546,7 @@ async def _prepare_blend_file_async(
         {
             "prepareId": prepare_id,
             "profile": profile,
-            "sourcePath": str(source_snapshot),
+            "sourcePath": str(source),
             "sourceKind": "BLEND_FILE",
             "sourceDisplayName": source.name,
             "previewPath": str(preview_path),

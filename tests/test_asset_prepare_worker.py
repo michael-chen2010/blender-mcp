@@ -299,6 +299,80 @@ def test_asset_pipeline_registers_preview_and_retains_immutable_source_snapshot(
     assert retained.read_bytes() == source_bytes
 
 
+def test_async_batch_prepare_opens_original_source_to_preserve_relative_dependencies(monkeypatch, tmp_path: Path):
+    from blender_mcp import asset_pipeline
+    from blender_mcp.prepared_artifacts import PreparedArtifactStore
+
+    source_dir = tmp_path / "asset"
+    source_dir.mkdir()
+    source = source_dir / "asset.blend"
+    source_bytes = b"BLENDER-source-with-relative-texture"
+    source.write_bytes(source_bytes)
+    texture = source_dir / "Textures" / "albedo.png"
+    texture.parent.mkdir()
+    texture.write_bytes(b"texture")
+    output_dir = tmp_path / "prepare"
+    store = PreparedArtifactStore(ttl_seconds=60)
+    opened_source_paths = []
+
+    class FakeProcess:
+        returncode = 0
+
+        def __init__(self, command):
+            self.command = command
+
+        async def communicate(self):
+            job_path = Path(self.command[-1])
+            job = json.loads(job_path.read_text(encoding="utf-8"))
+            opened_source = Path(job["sourcePath"])
+            opened_source_paths.append(opened_source)
+            assert opened_source.parent / "Textures" / "albedo.png" == texture
+            Path(job["previewPath"]).write_bytes(b"\x89PNG\r\n\x1a\npreview")
+            Path(job["observationCachePath"]).write_text(
+                json.dumps({"prepareId": job["prepareId"], "sections": {}}),
+                encoding="utf-8",
+            )
+            Path(job["resultPath"]).write_text(
+                json.dumps(
+                    {
+                        "status": "READY",
+                        "prepareId": job["prepareId"],
+                        "profile": job["profile"],
+                        "observation": {
+                            "prepareId": job["prepareId"],
+                            "source": {"sourceSha256": _sha256(opened_source)},
+                        },
+                        "previewPath": job["previewPath"],
+                        "timings": {"openMs": 1.0, "inspectMs": 2.0, "previewMs": 3.0},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return (b"", b"")
+
+    async def fake_create_subprocess_exec(*command, **_kwargs):
+        return FakeProcess(command)
+
+    monkeypatch.setattr(asset_pipeline.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    result = asyncio.run(
+        asset_pipeline._prepare_blend_file_async(
+            source,
+            profile="METADATA",
+            runtime=BlenderRuntime("C:/Blender/blender.exe", "ENV"),
+            prepare_id="prepare-relative-dependencies",
+            output_dir=output_dir,
+            artifact_store=store,
+            expected_source_fingerprint=_sha256(source),
+        )
+    )
+
+    assert opened_source_paths == [source.resolve()]
+    retained = store.retained_source_path(result["prepareId"])
+    assert retained != source.resolve()
+    assert retained.read_bytes() == source_bytes
+
+
 def test_async_supplemental_render_uses_shared_worker_slot_and_worker_mode(monkeypatch, tmp_path: Path):
     from contextlib import asynccontextmanager
     from blender_mcp import asset_pipeline
