@@ -907,3 +907,96 @@ def test_batch_mcp_inspect_prepared_assets_isolates_preview_failure(monkeypatch,
         TextContent,
     ]
 
+
+
+def test_batch_status_exposes_wall_clock_and_queue_timings(tmp_path: Path):
+    store = PreparedArtifactStore(ttl_seconds=60)
+    manager = asset_pipeline.AssetPipelineManager(
+        artifact_store=store,
+        runtime_provider=lambda: BlenderRuntime("C:/Blender/blender.exe", "ENV"),
+        prepare_runner=_ready_runner(store),
+    )
+    items = [
+        _source(tmp_path / "timing-a.blend", b"BLENDER-timing-a"),
+        _source(tmp_path / "timing-b.blend", b"BLENDER-timing-b"),
+    ]
+
+    async def scenario():
+        started = await manager.start_prepare_blend_assets(items, "PUBLISH", "timing-status")
+        await _wait_terminal(manager, started["batchPrepareId"])
+        page = manager.get_prepare_blend_assets(
+            started["batchPrepareId"],
+            limit=10,
+            mode="STATUS",
+        )
+
+        assert page["createdAt"].endswith("Z")
+        assert page["startedAt"].endswith("Z")
+        assert page["completedAt"].endswith("Z")
+        assert page["createdAt"] <= page["startedAt"] <= page["completedAt"]
+        for item in page["items"]:
+            assert item["queuedAt"].endswith("Z")
+            assert item["startedAt"].endswith("Z")
+            assert item["completedAt"].endswith("Z")
+            assert item["queuedAt"] <= item["startedAt"] <= item["completedAt"]
+            assert item["timings"]["queueMs"] >= 0
+            assert item["timings"]["totalMs"] == 1.0
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_five_hundred_item_status_page_remains_bounded(tmp_path: Path):
+    store = PreparedArtifactStore(ttl_seconds=60)
+    manager = asset_pipeline.AssetPipelineManager(
+        artifact_store=store,
+        runtime_provider=lambda: BlenderRuntime("C:/Blender/blender.exe", "ENV"),
+        prepare_runner=_ready_runner(store),
+    )
+    items = [
+        _source(
+            tmp_path / "bulk" / f"asset-{index:04d}.blend",
+            f"BLENDER-bulk-{index}".encode("ascii"),
+        )
+        for index in range(500)
+    ]
+
+    async def scenario():
+        started = await manager.start_prepare_blend_assets(
+            items,
+            "PUBLISH",
+            "five-hundred-status",
+            concurrency=12,
+        )
+        deadline = time.monotonic() + 10.0
+        while True:
+            status = manager.get_prepare_blend_assets(
+                started["batchPrepareId"],
+                limit=25,
+                mode="STATUS",
+            )
+            if status["status"] == "READY":
+                break
+            if time.monotonic() >= deadline:
+                raise AssertionError(f"500-item batch did not become READY: {status['counts']}")
+            await asyncio.sleep(0.01)
+
+        assert status["counts"]["READY"] == 500
+        assert len(status["items"]) == 25
+        assert status["nextCursor"] == "25"
+        assert all("result" not in item for item in status["items"])
+        assert all("prepareId" in item for item in status["items"])
+        assert len(repr(status)) < 40_000
+
+        second = manager.get_prepare_blend_assets(
+            started["batchPrepareId"],
+            cursor=status["nextCursor"],
+            limit=25,
+            mode="STATUS",
+        )
+        assert len(second["items"]) == 25
+        assert second["items"][0]["itemKey"] != status["items"][0]["itemKey"]
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+

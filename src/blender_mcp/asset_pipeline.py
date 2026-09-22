@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -454,6 +455,14 @@ _BATCH_AI_WINDOW_MAX = 16
 _BATCH_TERMINAL_STATES = {"READY", "FAILED", "CANCELLED"}
 
 
+def _utc_now_iso() -> str:
+    return (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+
+
 class AssetBatchError(RuntimeError):
     """Stable validation or scheduling error for local batch preparation."""
 
@@ -633,6 +642,11 @@ class _BatchPrepareItem:
     attempts: int = 0
     result: dict[str, Any] | None = None
     error: dict[str, str] | None = None
+    queued_at: str = field(default_factory=_utc_now_iso)
+    queued_perf: float = field(default_factory=time.perf_counter, repr=False)
+    started_at: str | None = None
+    completed_at: str | None = None
+    queue_ms: float | None = None
 
 
 @dataclass
@@ -646,6 +660,9 @@ class _BatchPrepareJob:
     request_fingerprints: dict[str, str] = field(default_factory=dict)
     tasks: set[asyncio.Task[Any]] = field(default_factory=set)
     last_concurrency: int = 1
+    created_at: str = field(default_factory=_utc_now_iso)
+    started_at: str | None = None
+    completed_at: str | None = None
 
 
 PrepareRunner = Callable[..., Awaitable[dict[str, Any]]]
@@ -772,6 +789,11 @@ class AssetPipelineManager:
         else:
             job.status = "CANCELLED"
 
+        if job.status == "RUNNING":
+            job.completed_at = None
+        elif job.completed_at is None:
+            job.completed_at = _utc_now_iso()
+
     async def _run_item(
         self,
         job: _BatchPrepareJob,
@@ -785,10 +807,18 @@ class AssetPipelineManager:
                     if job.cancel_requested:
                         item.status = "CANCELLED"
                         item.error = {"code": "BATCH_PREPARE_CANCELLED", "message": "Batch prepare item was cancelled"}
+                        item.completed_at = _utc_now_iso()
                         self._recompute_job_status(job)
                         return
+                    started_at = _utc_now_iso()
+                    started_perf = time.perf_counter()
+                    if job.started_at is None:
+                        job.started_at = started_at
                     item.status = "RUNNING"
                     item.attempts += 1
+                    item.started_at = started_at
+                    item.completed_at = None
+                    item.queue_ms = max(0.0, (started_perf - item.queued_perf) * 1000.0)
                     self._recompute_job_status(job)
 
                 if not item.path.is_file():
@@ -819,6 +849,7 @@ class AssetPipelineManager:
                     item.status = "READY"
                     item.result = result
                     item.error = None
+                    item.completed_at = _utc_now_iso()
                     work_dir = None
                     self._recompute_job_status(job)
         except asyncio.CancelledError:
@@ -827,6 +858,7 @@ class AssetPipelineManager:
                     item.status = "CANCELLED"
                     item.error = {"code": "BATCH_PREPARE_CANCELLED", "message": "Batch prepare item was cancelled"}
                     item.result = None
+                    item.completed_at = _utc_now_iso()
                     self._recompute_job_status(job)
             raise
         except Exception as exc:
@@ -835,6 +867,7 @@ class AssetPipelineManager:
                 item.status = "FAILED"
                 item.error = {"code": code, "message": message}
                 item.result = None
+                item.completed_at = _utc_now_iso()
                 self._recompute_job_status(job)
         finally:
             if work_dir is not None:
@@ -946,9 +979,16 @@ class AssetPipelineManager:
                 existing.status = "PENDING"
                 existing.result = None
                 existing.error = None
+                existing.queued_at = _utc_now_iso()
+                existing.queued_perf = time.perf_counter()
+                existing.started_at = None
+                existing.completed_at = None
+                existing.queue_ms = None
                 retry_keys.append(existing.item_key)
             job.request_fingerprints[idempotency_key] = fingerprint
             job.cancel_requested = False
+            if retry_keys:
+                job.completed_at = None
             job.last_concurrency = actual_concurrency
             if retry_keys:
                 job.status = "RUNNING"
@@ -983,6 +1023,21 @@ class AssetPipelineManager:
             "status": item.status,
             "attempts": item.attempts,
         }
+        if not include_result:
+            value["queuedAt"] = item.queued_at
+            if item.started_at is not None:
+                value["startedAt"] = item.started_at
+            if item.completed_at is not None:
+                value["completedAt"] = item.completed_at
+            status_timings: dict[str, Any] = {}
+            if item.queue_ms is not None:
+                status_timings["queueMs"] = round(item.queue_ms, 3)
+            if isinstance(item.result, Mapping):
+                result_timings = item.result.get("timings")
+                if isinstance(result_timings, Mapping) and result_timings.get("totalMs") is not None:
+                    status_timings["totalMs"] = result_timings.get("totalMs")
+            if status_timings:
+                value["timings"] = status_timings
         if item.status == "READY" and item.result is not None:
             if include_result:
                 value["result"] = self._public_result(item.result)
@@ -990,9 +1045,6 @@ class AssetPipelineManager:
                 prepare_id = item.result.get("prepareId")
                 if isinstance(prepare_id, str):
                     value["prepareId"] = prepare_id
-                timings = item.result.get("timings")
-                if isinstance(timings, Mapping):
-                    value["timings"] = dict(timings)
         if item.error is not None:
             value["error"] = dict(item.error)
         return value
@@ -1037,6 +1089,9 @@ class AssetPipelineManager:
                 "batchPrepareId": job.batch_prepare_id,
                 "status": job.status,
                 "mode": mode,
+                "createdAt": job.created_at,
+                "startedAt": job.started_at,
+                "completedAt": job.completed_at,
                 "counts": counts,
                 "items": [
                     self._item_public(
