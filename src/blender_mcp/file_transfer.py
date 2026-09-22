@@ -505,11 +505,8 @@ class PreparedArtifactTransferService:
 
         normalized_items = [_normalize_item(item) for item in items]
         artifact_ids = [item["artifactId"] for item in normalized_items]
-        item_keys = [item["itemKey"] for item in normalized_items]
         if len(set(artifact_ids)) != len(artifact_ids):
             raise FileTransferError("UPLOAD_DUPLICATE_ARTIFACT", "upload items must use unique artifactId values")
-        if len(set(item_keys)) != len(item_keys):
-            raise FileTransferError("UPLOAD_DUPLICATE_ITEM_KEY", "upload items must use unique itemKey values")
         requested_concurrency = self._normalize_concurrency(concurrency)
         fingerprint = _request_fingerprint(batch_prepare_id, normalized_items)
 

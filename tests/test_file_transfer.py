@@ -340,6 +340,63 @@ def test_unexpected_transport_failure_is_sanitized(tmp_path: Path, monkeypatch, 
     assert auth_secret not in logs
 
 
+def test_batch_rejects_duplicate_artifact_id_even_when_item_keys_differ(tmp_path: Path):
+    store, refs, _ = _register_payloads(tmp_path, count=1)
+    service = PreparedArtifactTransferService(store)
+    first = _grant_item("item-a", refs[0], "https://uploads.example.test/first")
+    second = _grant_item("item-b", refs[0], "https://uploads.example.test/second")
+
+    async def scenario():
+        with pytest.raises(FileTransferError) as duplicate:
+            await service.start_upload_prepared_artifacts(
+                "batch-prepare-1",
+                [first, second],
+                "duplicate-artifact",
+            )
+        assert duplicate.value.code == "UPLOAD_DUPLICATE_ARTIFACT"
+
+    asyncio.run(scenario())
+
+
+def test_batch_allows_multiple_artifacts_for_the_same_item_key(tmp_path: Path):
+    store, refs, paths = _register_payloads(tmp_path, count=2)
+    fixture = _UploadFixture()
+
+    async def scenario(base_url: str):
+        manifest = {
+            "item-a": {refs[0].artifact_id, refs[1].artifact_id},
+        }
+        service = PreparedArtifactTransferService(
+            store,
+            prepare_manifest_resolver=lambda batch_prepare_id: manifest
+            if batch_prepare_id == "batch-prepare-1"
+            else None,
+        )
+        started = await service.start_upload_prepared_artifacts(
+            "batch-prepare-1",
+            [
+                _grant_item("item-a", refs[0], f"{base_url}/payload"),
+                _grant_item("item-a", refs[1], f"{base_url}/main-preview"),
+            ],
+            "same-item-multiple-artifacts",
+            concurrency=2,
+        )
+        terminal = await _wait_terminal(service, started["uploadId"])
+
+        assert terminal["status"] == "SUCCEEDED"
+        assert len(terminal["items"]) == 2
+        assert [item["itemKey"] for item in terminal["items"]] == ["item-a", "item-a"]
+        assert {item["artifactId"] for item in terminal["items"]} == {
+            refs[0].artifact_id,
+            refs[1].artifact_id,
+        }
+        assert fixture.received["/payload"] == [paths[0].read_bytes()]
+        assert fixture.received["/main-preview"] == [paths[1].read_bytes()]
+
+    with _upload_server(fixture) as base_url:
+        asyncio.run(scenario(base_url))
+
+
 def test_batch_partial_failure_retry_membership_and_success_replay(tmp_path: Path):
     store, refs, _ = _register_payloads(tmp_path, count=3)
     fixture = _UploadFixture()

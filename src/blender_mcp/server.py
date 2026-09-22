@@ -1076,7 +1076,7 @@ async def start_upload_prepared_artifacts(
     upload_id: str | None = None,
     concurrency: int | None = None,
 ) -> CallToolResult:
-    """Start or retry a local asynchronous prepared-artifact upload job."""
+    """Start or retry an asynchronous upload job; one itemKey may carry multiple artifactId values."""
 
     try:
         result = await get_prepared_artifact_transfer_service().start_upload_prepared_artifacts(
