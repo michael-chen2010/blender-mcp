@@ -672,14 +672,21 @@ def test_batch_mcp_inspect_prepared_assets_returns_compact_item_keyed_previews(m
                             "observation": {
                                 "schemaVersion": 1,
                                 "analyzerVersion": "test-analyzer",
-                                "observationScope": "SOURCE_ASSET",
-                                "source": {"displayName": "a.blend"},
+                                "observationScope": "PUBLISH_PAYLOAD",
+                                "source": {
+                                    "kind": "BLEND_FILE",
+                                    "displayName": "a.blend",
+                                    "sourceSize": 1234,
+                                    "sourceSha256": "e" * 64,
+                                    "blenderVersion": "5.2.1 LTS",
+                                },
                                 "structure": {"objectCount": 2},
                                 "geometry": {
                                     "vertexCount": 10,
                                     "triangleCount": 12,
                                     "dimensionsMeters": {"x": 1.0, "y": 2.0, "z": 3.0},
                                     "hasUv": True,
+                                    "lodCount": 1,
                                 },
                                 "materials": {
                                     "materialCount": 1,
@@ -690,6 +697,19 @@ def test_batch_mcp_inspect_prepared_assets_returns_compact_item_keyed_previews(m
                                 "evidenceSummary": {
                                     "objectNames": ["Body", "Cap"],
                                     "materialNames": ["Plastic"],
+                                },
+                                "previewEvidence": {
+                                    "presetVersion": "asset-preview-v1",
+                                    "main": {"width": 512, "height": 512, "view": "THREE_QUARTER"},
+                                    "supplementalViews": [],
+                                },
+                                "payloadEvidence": {
+                                    "format": "BLEND",
+                                    "compression": "NONE",
+                                    "generatedBlenderVersion": "5.2.1 LTS",
+                                    "sha256": "f" * 64,
+                                    "size": 9876,
+                                    "factsVerifiedAfterReopen": True,
                                 },
                             },
                             "artifacts": [
@@ -782,7 +802,22 @@ def test_batch_mcp_inspect_prepared_assets_returns_compact_item_keyed_previews(m
     assert "observation" not in first
     assert first["compactObservation"]["objectCount"] == 2
     assert first["compactObservation"]["triangleCount"] == 12
+    assert first["compactObservation"]["lodCount"] == 1
     assert first["compactObservation"]["primaryObjectNames"] == ["Body", "Cap"]
+    assert first["compactObservation"]["source"] == {
+        "kind": "BLEND_FILE",
+        "displayName": "a.blend",
+        "sourceSize": 1234,
+        "sourceSha256": "e" * 64,
+        "blenderVersion": "5.2.1 LTS",
+    }
+    assert first["compactObservation"]["mainPreviewEvidence"] == {
+        "presetVersion": "asset-preview-v1",
+        "width": 512,
+        "height": 512,
+        "view": "THREE_QUARTER",
+    }
+    assert first["compactObservation"]["payloadEvidence"]["generatedBlenderVersion"] == "5.2.1 LTS"
     assert first["preparedArtifacts"]["mainPreview"]["artifactId"] == "preview-a"
     assert "base64" not in repr(result.structuredContent).lower()
     assert [type(block) for block in result.content] == [

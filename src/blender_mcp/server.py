@@ -796,18 +796,31 @@ def _bounded_string_values(value: Any, *, limit: int = _COMPACT_NAME_LIMIT) -> l
 def _compact_prepared_observation(observation: Any) -> Dict[str, Any]:
     if not isinstance(observation, dict):
         return {}
+    source = observation.get("source") if isinstance(observation.get("source"), dict) else {}
     structure = observation.get("structure") if isinstance(observation.get("structure"), dict) else {}
     geometry = observation.get("geometry") if isinstance(observation.get("geometry"), dict) else {}
     materials = observation.get("materials") if isinstance(observation.get("materials"), dict) else {}
     deformation = observation.get("deformation") if isinstance(observation.get("deformation"), dict) else {}
     evidence = observation.get("evidenceSummary") if isinstance(observation.get("evidenceSummary"), dict) else {}
+    preview_evidence = observation.get("previewEvidence") if isinstance(observation.get("previewEvidence"), dict) else {}
+    payload_evidence = observation.get("payloadEvidence") if isinstance(observation.get("payloadEvidence"), dict) else {}
 
     compact: Dict[str, Any] = {}
+    if observation.get("observationScope") is not None:
+        compact["observationScope"] = observation.get("observationScope")
+    compact_source = {
+        key: source[key]
+        for key in ("kind", "displayName", "sourceSize", "sourceSha256", "blenderVersion")
+        if key in source
+    }
+    if compact_source:
+        compact["source"] = compact_source
     scalar_fields = (
         ("objectCount", structure.get("objectCount")),
         ("vertexCount", geometry.get("vertexCount")),
         ("triangleCount", geometry.get("triangleCount")),
         ("hasUv", geometry.get("hasUv")),
+        ("lodCount", geometry.get("lodCount")),
         ("materialCount", materials.get("materialCount")),
         ("materialWorkflow", materials.get("materialWorkflow")),
         ("rigged", deformation.get("rigged")),
@@ -834,6 +847,32 @@ def _compact_prepared_observation(observation: Any) -> Dict[str, Any]:
         ][:16]
     compact["primaryObjectNames"] = _bounded_string_values(evidence.get("objectNames"))
     compact["materialNames"] = _bounded_string_values(evidence.get("materialNames"))
+
+    preview_main = preview_evidence.get("main") if isinstance(preview_evidence.get("main"), dict) else {}
+    main_preview_evidence = {
+        key: preview_main[key]
+        for key in ("width", "height", "view")
+        if key in preview_main
+    }
+    if preview_evidence.get("presetVersion") is not None:
+        main_preview_evidence["presetVersion"] = preview_evidence.get("presetVersion")
+    if main_preview_evidence:
+        compact["mainPreviewEvidence"] = main_preview_evidence
+
+    compact_payload_evidence = {
+        key: payload_evidence[key]
+        for key in (
+            "format",
+            "compression",
+            "generatedBlenderVersion",
+            "sha256",
+            "size",
+            "factsVerifiedAfterReopen",
+        )
+        if key in payload_evidence
+    }
+    if compact_payload_evidence:
+        compact["payloadEvidence"] = compact_payload_evidence
     return compact
 
 
