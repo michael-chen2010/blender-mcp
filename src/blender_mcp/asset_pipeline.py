@@ -974,7 +974,7 @@ class AssetPipelineManager:
         }
         return public
 
-    def _item_public(self, item: _BatchPrepareItem) -> dict[str, Any]:
+    def _item_public(self, item: _BatchPrepareItem, *, include_result: bool) -> dict[str, Any]:
         value: dict[str, Any] = {
             "itemKey": item.item_key,
             "sourceDisplayName": item.source_display_name,
@@ -983,7 +983,15 @@ class AssetPipelineManager:
             "attempts": item.attempts,
         }
         if item.status == "READY" and item.result is not None:
-            value["result"] = self._public_result(item.result)
+            if include_result:
+                value["result"] = self._public_result(item.result)
+            else:
+                prepare_id = item.result.get("prepareId")
+                if isinstance(prepare_id, str):
+                    value["prepareId"] = prepare_id
+                timings = item.result.get("timings")
+                if isinstance(timings, Mapping):
+                    value["timings"] = dict(timings)
         if item.error is not None:
             value["error"] = dict(item.error)
         return value
@@ -993,9 +1001,15 @@ class AssetPipelineManager:
         batch_prepare_id: str,
         cursor: str | None = None,
         limit: int | None = None,
+        mode: str = "LEGACY_FULL",
     ) -> dict[str, Any]:
         if not isinstance(batch_prepare_id, str) or not batch_prepare_id:
             raise AssetBatchError("BATCH_PREPARE_ID_REQUIRED", "batch_prepare_id is required")
+        if mode not in {"STATUS", "LEGACY_FULL"}:
+            raise AssetBatchError(
+                "BATCH_PREPARE_MODE_INVALID",
+                "mode must be STATUS or LEGACY_FULL",
+            )
         page_limit = self._page_size if limit is None else limit
         if isinstance(page_limit, bool) or not isinstance(page_limit, int) or page_limit <= 0 or page_limit > _BATCH_MAX_PAGE_SIZE:
             raise AssetBatchError("BATCH_PREPARE_LIMIT_INVALID", f"limit must be between 1 and {_BATCH_MAX_PAGE_SIZE}")
@@ -1021,8 +1035,15 @@ class AssetPipelineManager:
             return {
                 "batchPrepareId": job.batch_prepare_id,
                 "status": job.status,
+                "mode": mode,
                 "counts": counts,
-                "items": [self._item_public(job.items[item_key]) for item_key in job.order[offset:end]],
+                "items": [
+                    self._item_public(
+                        job.items[item_key],
+                        include_result=mode == "LEGACY_FULL",
+                    )
+                    for item_key in job.order[offset:end]
+                ],
                 "nextCursor": str(end) if end < len(job.order) else None,
             }
 

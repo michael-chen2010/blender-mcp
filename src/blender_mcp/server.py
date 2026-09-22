@@ -783,12 +783,13 @@ async def prepare_blend_asset(
 
 
 def _batch_prepare_page_content(page: Dict[str, Any]) -> CallToolResult:
-    """Convert an internal batch page into path-free structured data plus preview images."""
+    """Convert an internal batch page into bounded model-visible content."""
 
-    store = get_prepared_artifact_store()
+    mode = page.get("mode") or "LEGACY_FULL"
     public_page: Dict[str, Any] = {
         "batchPrepareId": page.get("batchPrepareId"),
         "status": page.get("status"),
+        "mode": mode,
         "counts": page.get("counts", {}),
         "items": [],
         "nextCursor": page.get("nextCursor"),
@@ -800,6 +801,29 @@ def _batch_prepare_page_content(page: Dict[str, Any]) -> CallToolResult:
         )
     ]
     raw_items = page.get("items") if isinstance(page.get("items"), list) else []
+    if mode == "STATUS":
+        for raw_item in raw_items:
+            if not isinstance(raw_item, dict):
+                continue
+            public_page["items"].append(
+                {
+                    key: raw_item[key]
+                    for key in (
+                        "itemKey",
+                        "sourceDisplayName",
+                        "sourceFingerprint",
+                        "status",
+                        "attempts",
+                        "prepareId",
+                        "timings",
+                        "error",
+                    )
+                    if key in raw_item
+                }
+            )
+        return CallToolResult(content=content, structuredContent=public_page, isError=False)
+
+    store = get_prepared_artifact_store()
     for raw_item in raw_items:
         if not isinstance(raw_item, dict):
             continue
@@ -914,15 +938,25 @@ def get_prepare_blend_assets(
     batch_prepare_id: str,
     cursor: str | None = None,
     limit: int = 50,
+    mode: str = "LEGACY_FULL",
 ) -> CallToolResult:
-    """Return one bounded batch page with adjacent item labels and MAIN previews."""
+    """Read batch state; STATUS is lightweight while LEGACY_FULL preserves preview-compatible output."""
 
     try:
-        page = get_asset_pipeline_manager().get_prepare_blend_assets(
-            batch_prepare_id,
-            cursor=cursor,
-            limit=limit,
-        )
+        manager = get_asset_pipeline_manager()
+        if mode == "LEGACY_FULL":
+            page = manager.get_prepare_blend_assets(
+                batch_prepare_id,
+                cursor=cursor,
+                limit=limit,
+            )
+        else:
+            page = manager.get_prepare_blend_assets(
+                batch_prepare_id,
+                cursor=cursor,
+                limit=limit,
+                mode=mode,
+            )
         return _batch_prepare_page_content(page)
     except AssetBatchError as exc:
         return _prepare_blend_asset_error(exc.code, exc.message)

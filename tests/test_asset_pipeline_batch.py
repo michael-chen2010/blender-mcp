@@ -518,3 +518,80 @@ def test_batch_mcp_get_returns_item_labels_and_adjacent_images(monkeypatch, tmp_
     assert [type(block) for block in result.content] == [TextContent, TextContent, ImageContent, TextContent, ImageContent]
     assert result.content[1].text == "item-a — a.blend"
     assert result.content[3].text == "item-b — b.blend"
+
+
+def test_batch_status_mode_is_lightweight_and_keeps_ready_identity(tmp_path: Path):
+    store = PreparedArtifactStore(ttl_seconds=60)
+    manager = asset_pipeline.AssetPipelineManager(
+        artifact_store=store,
+        runtime_provider=lambda: BlenderRuntime("C:/Blender/blender.exe", "ENV"),
+        prepare_runner=_ready_runner(store),
+    )
+    items = [
+        _source(tmp_path / "status-a.blend", b"BLENDER-status-a"),
+        _source(tmp_path / "status-b.blend", b"BLENDER-status-b"),
+    ]
+
+    async def scenario():
+        started = await manager.start_prepare_blend_assets(items, "PUBLISH", "status-lightweight")
+        terminal = await _wait_terminal(manager, started["batchPrepareId"])
+        full_by_key = {item["itemKey"]: item for item in terminal["items"]}
+
+        status_page = manager.get_prepare_blend_assets(
+            started["batchPrepareId"],
+            limit=10,
+            mode="STATUS",
+        )
+
+        assert status_page["status"] == "READY"
+        assert status_page["counts"]["READY"] == 2
+        for item in status_page["items"]:
+            assert "result" not in item
+            assert item["prepareId"] == full_by_key[item["itemKey"]]["result"]["prepareId"]
+            assert item["timings"]["totalMs"] == 1.0
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_batch_mcp_status_mode_returns_no_preview_images(monkeypatch):
+    from blender_mcp import server
+
+    class FakeManager:
+        def get_prepare_blend_assets(self, batch_prepare_id, cursor=None, limit=None, mode=None):
+            assert batch_prepare_id == "batch-status"
+            assert mode == "STATUS"
+            return {
+                "batchPrepareId": "batch-status",
+                "status": "READY",
+                "mode": "STATUS",
+                "counts": {"PENDING": 0, "RUNNING": 0, "READY": 1, "FAILED": 0, "CANCELLED": 0},
+                "items": [
+                    {
+                        "itemKey": "item-ready",
+                        "sourceDisplayName": "ready.blend",
+                        "sourceFingerprint": "a" * 64,
+                        "status": "READY",
+                        "attempts": 1,
+                        "prepareId": "prepare-ready",
+                        "timings": {"totalMs": 12.5},
+                    }
+                ],
+                "nextCursor": None,
+            }
+
+    monkeypatch.setattr(server, "get_asset_pipeline_manager", lambda: FakeManager(), raising=False)
+
+    result = asyncio.run(
+        server.mcp.call_tool(
+            "get_prepare_blend_assets",
+            {"batch_prepare_id": "batch-status", "limit": 10, "mode": "STATUS"},
+        )
+    )
+
+    assert isinstance(result, CallToolResult)
+    assert result.isError is False
+    assert result.structuredContent["items"][0]["prepareId"] == "prepare-ready"
+    assert "result" not in result.structuredContent["items"][0]
+    assert [type(block) for block in result.content] == [TextContent]
+
