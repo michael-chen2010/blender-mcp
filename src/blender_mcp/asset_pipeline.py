@@ -1154,6 +1154,21 @@ class AssetPipelineManager:
             if job is None:
                 raise AssetBatchError("BATCH_PREPARE_NOT_FOUND", "Unknown batch_prepare_id")
 
+            # The current AI window acts as a heartbeat for the READY tail.
+            # This keeps large batches consumable without extending already-expired handles.
+            for ready_item_key in job.order:
+                ready_item = job.items[ready_item_key]
+                if ready_item.status != "READY" or not isinstance(ready_item.result, dict):
+                    continue
+                ready_prepare_id = ready_item.result.get("prepareId")
+                if not isinstance(ready_prepare_id, str) or not ready_prepare_id:
+                    continue
+                try:
+                    self._artifact_store.renew_prepare(ready_prepare_id)
+                except PreparedArtifactError:
+                    # Expired/corrupt siblings stay expired and are isolated when selected.
+                    continue
+
             public_items: list[dict[str, Any]] = []
             for item_key, prepare_id in normalized:
                 item = job.items.get(item_key)

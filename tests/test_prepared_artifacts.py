@@ -210,3 +210,35 @@ def test_register_workspace_rejects_observation_cache_outside_workspace(tmp_path
             observation_cache_path=outside_cache,
         )
     assert exc_info.value.code == "PREPARED_ARTIFACT_INVALID_PATH"
+
+
+def test_renew_prepare_extends_live_workspace_and_artifacts_without_reviving_expired(tmp_path: Path):
+    clock = _Clock()
+    workspace = tmp_path / "prepare-renew"
+    workspace.mkdir()
+    preview = workspace / "main.png"
+    preview.write_bytes(b"preview-renew")
+
+    store = PreparedArtifactStore(ttl_seconds=5, clock=clock)
+    store.register_workspace("prepare-renew", workspace)
+    original = store.register_artifact(
+        "prepare-renew",
+        "PREVIEW",
+        preview,
+        content_type="image/png",
+    )
+
+    clock.advance(4)
+    renewed = store.renew_prepare("prepare-renew")
+    assert renewed["prepareId"] == "prepare-renew"
+    assert renewed["expiresAt"] > original.expires_at
+    assert store.artifact_ref(original.artifact_id).expires_at == renewed["expiresAt"]
+
+    clock.advance(2)
+    assert store.resolve(original.artifact_id) == preview.resolve()
+
+    clock.advance(4)
+    with pytest.raises(PreparedArtifactError) as exc_info:
+        store.renew_prepare("prepare-renew")
+    assert exc_info.value.code == "PREPARED_ARTIFACT_EXPIRED"
+

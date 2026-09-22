@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import hashlib
 from pathlib import Path
@@ -354,6 +354,35 @@ class PreparedArtifactStore:
                     "Observation cache bytes no longer match the registered identity",
                 )
             return resolved
+
+    def renew_prepare(self, prepare_id: str) -> dict[str, str | int]:
+        """Extend one still-live prepare workspace without reviving expired handles."""
+
+        with self._lock:
+            workspace = self._workspace_for_read(prepare_id)
+            now = self._clock()
+            expires_epoch = now + self._ttl_seconds
+            workspace.expires_at_epoch = max(workspace.expires_at_epoch, expires_epoch)
+
+            renewed_artifacts = 0
+            for artifact_id in workspace.artifact_ids:
+                record = self._artifacts.get(artifact_id)
+                if record is None or record.prepare_id != prepare_id:
+                    continue
+                if now >= record.expires_at_epoch:
+                    continue
+                record.expires_at_epoch = max(record.expires_at_epoch, expires_epoch)
+                record.ref = replace(
+                    record.ref,
+                    expires_at=_iso_utc(record.expires_at_epoch),
+                )
+                renewed_artifacts += 1
+
+            return {
+                "prepareId": prepare_id,
+                "expiresAt": _iso_utc(workspace.expires_at_epoch),
+                "renewedArtifacts": renewed_artifacts,
+            }
 
     @contextmanager
     def lease(self, prepare_id: str) -> Iterator[Path]:

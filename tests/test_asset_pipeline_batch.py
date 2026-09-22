@@ -1035,3 +1035,51 @@ def test_five_hundred_item_status_page_remains_bounded(tmp_path: Path):
 
     asyncio.run(scenario())
 
+
+
+def test_ai_ready_window_heartbeats_unconsumed_ready_siblings(tmp_path: Path):
+    class Clock:
+        def __init__(self):
+            self.value = 1_800_000_000.0
+
+        def __call__(self):
+            return self.value
+
+        def advance(self, seconds: float):
+            self.value += seconds
+
+    clock = Clock()
+    store = PreparedArtifactStore(ttl_seconds=5, clock=clock)
+    manager = asset_pipeline.AssetPipelineManager(
+        artifact_store=store,
+        runtime_provider=lambda: BlenderRuntime("C:/Blender/blender.exe", "ENV"),
+        prepare_runner=_ready_runner(store),
+    )
+    items = [
+        _source(tmp_path / "heartbeat-a.blend", b"BLENDER-heartbeat-a"),
+        _source(tmp_path / "heartbeat-b.blend", b"BLENDER-heartbeat-b"),
+    ]
+
+    async def scenario():
+        started = await manager.start_prepare_blend_assets(items, "PUBLISH", "heartbeat-ready-tail")
+        terminal = await _wait_terminal(manager, started["batchPrepareId"])
+        ready = terminal["items"]
+        first = ready[0]
+        second = ready[1]
+        second_preview_id = second["result"]["artifacts"][0]["artifact_id"]
+
+        clock.advance(4)
+        manager.get_prepared_asset_window(
+            started["batchPrepareId"],
+            [{
+                "itemKey": first["itemKey"],
+                "prepareId": first["result"]["prepareId"],
+            }],
+        )
+
+        clock.advance(2)
+        assert store.resolve(second_preview_id).is_file()
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
