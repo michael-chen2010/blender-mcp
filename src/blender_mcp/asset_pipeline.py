@@ -450,6 +450,7 @@ async def render_supplemental_view(
 # logical import batch; Blender-MCP only owns short-lived local worker state.
 _BATCH_PAGE_SIZE = 50
 _BATCH_MAX_PAGE_SIZE = 100
+_BATCH_AI_WINDOW_MAX = 16
 _BATCH_TERMINAL_STATES = {"READY", "FAILED", "CANCELLED"}
 
 
@@ -1045,6 +1046,90 @@ class AssetPipelineManager:
                     for item_key in job.order[offset:end]
                 ],
                 "nextCursor": str(end) if end < len(job.order) else None,
+            }
+
+    def get_prepared_asset_window(
+        self,
+        batch_prepare_id: str,
+        items: Any,
+    ) -> dict[str, Any]:
+        if not isinstance(batch_prepare_id, str) or not batch_prepare_id:
+            raise AssetBatchError("BATCH_PREPARE_ID_REQUIRED", "batch_prepare_id is required")
+        if not isinstance(items, list) or not items:
+            raise AssetBatchError(
+                "BATCH_PREPARE_WINDOW_ITEMS_REQUIRED",
+                "at least one prepared item is required",
+            )
+        if len(items) > _BATCH_AI_WINDOW_MAX:
+            raise AssetBatchError(
+                "BATCH_PREPARE_WINDOW_TOO_LARGE",
+                f"prepared asset window cannot exceed {_BATCH_AI_WINDOW_MAX} items",
+            )
+
+        normalized: list[tuple[str, str]] = []
+        seen_item_keys: set[str] = set()
+        for raw in items:
+            if not isinstance(raw, Mapping):
+                raise AssetBatchError(
+                    "BATCH_PREPARE_WINDOW_ITEM_INVALID",
+                    "each prepared asset window item must be an object",
+                )
+            item_key = raw.get("itemKey")
+            prepare_id = raw.get("prepareId")
+            if not isinstance(item_key, str) or not item_key:
+                raise AssetBatchError(
+                    "BATCH_PREPARE_WINDOW_ITEM_KEY_REQUIRED",
+                    "itemKey is required",
+                )
+            if not isinstance(prepare_id, str) or not prepare_id:
+                raise AssetBatchError(
+                    "BATCH_PREPARE_WINDOW_PREPARE_ID_REQUIRED",
+                    "prepareId is required",
+                )
+            if item_key in seen_item_keys:
+                raise AssetBatchError(
+                    "BATCH_PREPARE_WINDOW_DUPLICATE_ITEM",
+                    "prepared asset window itemKey values must be unique",
+                )
+            seen_item_keys.add(item_key)
+            normalized.append((item_key, prepare_id))
+
+        with self._lock:
+            job = self._jobs.get(batch_prepare_id)
+            if job is None:
+                raise AssetBatchError("BATCH_PREPARE_NOT_FOUND", "Unknown batch_prepare_id")
+
+            public_items: list[dict[str, Any]] = []
+            for item_key, prepare_id in normalized:
+                item = job.items.get(item_key)
+                if item is None:
+                    raise AssetBatchError(
+                        "BATCH_PREPARE_WINDOW_ITEM_NOT_FOUND",
+                        f"itemKey is not part of batch: {item_key}",
+                    )
+                if item.status != "READY" or not isinstance(item.result, dict):
+                    raise AssetBatchError(
+                        "BATCH_PREPARE_WINDOW_ITEM_NOT_READY",
+                        f"itemKey is not READY: {item_key}",
+                    )
+                current_prepare_id = item.result.get("prepareId")
+                if current_prepare_id != prepare_id:
+                    raise AssetBatchError(
+                        "BATCH_PREPARE_WINDOW_IDENTITY_MISMATCH",
+                        f"prepareId does not match the READY item: {item_key}",
+                    )
+                public_items.append(
+                    {
+                        "itemKey": item.item_key,
+                        "sourceDisplayName": item.source_display_name,
+                        "sourceFingerprint": item.source_fingerprint,
+                        "result": self._public_result(item.result),
+                    }
+                )
+
+            return {
+                "batchPrepareId": job.batch_prepare_id,
+                "items": public_items,
             }
 
     async def cancel_prepare_blend_assets(self, batch_prepare_id: str) -> dict[str, Any]:

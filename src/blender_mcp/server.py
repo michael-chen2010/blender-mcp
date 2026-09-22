@@ -46,6 +46,7 @@ from .asset_pipeline import (
     prepare_blend_file,
     render_supplemental_view,
 )
+from .prepared_artifacts import PreparedArtifactError
 from .prepared_observation import PreparedObservationError, PreparedObservationService
 from .file_transfer import FileTransferError, PreparedArtifactTransferService
 
@@ -782,6 +783,184 @@ async def prepare_blend_asset(
         return _stable_prepare_error(exc, "BLENDER_PREPARE_FAILED")
 
 
+_PREPARED_ASSET_WINDOW_MAX = 16
+_COMPACT_NAME_LIMIT = 12
+
+
+def _bounded_string_values(value: Any, *, limit: int = _COMPACT_NAME_LIMIT) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str) and item][:limit]
+
+
+def _compact_prepared_observation(observation: Any) -> Dict[str, Any]:
+    if not isinstance(observation, dict):
+        return {}
+    structure = observation.get("structure") if isinstance(observation.get("structure"), dict) else {}
+    geometry = observation.get("geometry") if isinstance(observation.get("geometry"), dict) else {}
+    materials = observation.get("materials") if isinstance(observation.get("materials"), dict) else {}
+    deformation = observation.get("deformation") if isinstance(observation.get("deformation"), dict) else {}
+    evidence = observation.get("evidenceSummary") if isinstance(observation.get("evidenceSummary"), dict) else {}
+
+    compact: Dict[str, Any] = {}
+    scalar_fields = (
+        ("objectCount", structure.get("objectCount")),
+        ("vertexCount", geometry.get("vertexCount")),
+        ("triangleCount", geometry.get("triangleCount")),
+        ("hasUv", geometry.get("hasUv")),
+        ("materialCount", materials.get("materialCount")),
+        ("materialWorkflow", materials.get("materialWorkflow")),
+        ("rigged", deformation.get("rigged")),
+        ("animated", deformation.get("animated")),
+        ("armatureCount", deformation.get("armatureCount")),
+        ("actionCount", deformation.get("actionCount")),
+        ("shapeKeyCount", deformation.get("shapeKeyCount")),
+    )
+    for key, value in scalar_fields:
+        if value is not None:
+            compact[key] = value
+
+    dimensions = geometry.get("dimensionsMeters")
+    if isinstance(dimensions, dict):
+        compact["dimensionsMeters"] = {
+            axis: dimensions[axis]
+            for axis in ("x", "y", "z")
+            if axis in dimensions
+        }
+    pbr_channels = materials.get("pbrChannels")
+    if isinstance(pbr_channels, list):
+        compact["pbrChannels"] = [
+            value for value in pbr_channels if isinstance(value, str)
+        ][:16]
+    compact["primaryObjectNames"] = _bounded_string_values(evidence.get("objectNames"))
+    compact["materialNames"] = _bounded_string_values(evidence.get("materialNames"))
+    return compact
+
+
+def _public_prepared_artifact(raw: Any) -> Dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    artifact_id = raw.get("artifact_id") or raw.get("artifactId")
+    kind = raw.get("kind")
+    if not isinstance(artifact_id, str) or not isinstance(kind, str):
+        return None
+    return {
+        "artifactId": artifact_id,
+        "kind": kind,
+        "size": raw.get("size"),
+        "sha256": raw.get("sha256"),
+        "mimeType": raw.get("content_type") or raw.get("mimeType"),
+        "expiresAt": raw.get("expires_at") or raw.get("expiresAt"),
+    }
+
+
+def _prepared_window_item_content(raw_item: Dict[str, Any]) -> tuple[Dict[str, Any], TextContent, Any | None]:
+    started = time.perf_counter()
+    item_key = str(raw_item.get("itemKey") or "")
+    source_display_name = str(raw_item.get("sourceDisplayName") or "")
+    source_fingerprint = raw_item.get("sourceFingerprint")
+    result = raw_item.get("result") if isinstance(raw_item.get("result"), dict) else {}
+    prepare_id = result.get("prepareId")
+
+    if not isinstance(prepare_id, str) or not prepare_id:
+        structured = {
+            "itemKey": item_key,
+            "sourceDisplayName": source_display_name,
+            "status": "FAILED",
+            "error": {
+                "code": "BATCH_PREPARE_WINDOW_RESULT_INVALID",
+                "message": "READY item has no prepareId",
+            },
+        }
+        return structured, TextContent(type="text", text=f"{item_key} — {source_display_name}: unavailable"), None
+
+    try:
+        store = get_prepared_artifact_store()
+        preview_identity: Dict[str, Any] | None = None
+        payload_identity: Dict[str, Any] | None = None
+        preview_path: Path | None = None
+        with store.lease(prepare_id):
+            for raw_artifact in result.get("artifacts", []):
+                public_artifact = _public_prepared_artifact(raw_artifact)
+                if public_artifact is None:
+                    continue
+                if public_artifact["kind"] == "PREVIEW" and preview_identity is None:
+                    preview_identity = public_artifact
+                    preview_path = store.resolve(public_artifact["artifactId"])
+                elif public_artifact["kind"] == "PAYLOAD" and payload_identity is None:
+                    payload_identity = public_artifact
+
+            if preview_identity is None or preview_path is None:
+                raise PreparedArtifactError(
+                    "PREPARED_WINDOW_MAIN_PREVIEW_MISSING",
+                    "READY item has no registered MAIN preview",
+                )
+            mime_type = preview_identity.get("mimeType")
+            image_format = "jpeg" if mime_type == "image/jpeg" else "png"
+            image_content = Image(path=preview_path, format=image_format).to_image_content()
+
+        observation = result.get("observation") if isinstance(result.get("observation"), dict) else {}
+        evidence_identity: Dict[str, Any] = {"prepareId": prepare_id}
+        if isinstance(source_fingerprint, str):
+            evidence_identity["sourceFingerprint"] = source_fingerprint
+        if observation.get("analyzerVersion") is not None:
+            evidence_identity["analyzerVersion"] = observation.get("analyzerVersion")
+        if observation.get("schemaVersion") is not None:
+            evidence_identity["observationSchemaVersion"] = observation.get("schemaVersion")
+
+        prepared_artifacts: Dict[str, Any] = {"mainPreview": preview_identity}
+        if payload_identity is not None:
+            prepared_artifacts["payload"] = payload_identity
+
+        structured = {
+            "itemKey": item_key,
+            "prepareId": prepare_id,
+            "sourceDisplayName": source_display_name,
+            "status": "READY",
+            "evidenceIdentity": evidence_identity,
+            "compactObservation": _compact_prepared_observation(observation),
+            "preparedArtifacts": prepared_artifacts,
+            "validation": result.get("validation") if isinstance(result.get("validation"), dict) else {},
+            "timings": {
+                "cacheReadMs": round((time.perf_counter() - started) * 1000.0, 3),
+            },
+        }
+        label = TextContent(type="text", text=f"{item_key} — {source_display_name}")
+        return structured, label, image_content
+    except PreparedArtifactError as exc:
+        structured = {
+            "itemKey": item_key,
+            "prepareId": prepare_id,
+            "sourceDisplayName": source_display_name,
+            "status": "FAILED",
+            "error": {
+                "code": exc.code,
+                "message": str(exc).partition(":")[2].strip() or str(exc),
+            },
+            "timings": {
+                "cacheReadMs": round((time.perf_counter() - started) * 1000.0, 3),
+            },
+        }
+        label = TextContent(type="text", text=f"{item_key} — {source_display_name}: {exc.code}")
+        return structured, label, None
+    except (FileNotFoundError, OSError) as exc:
+        structured = {
+            "itemKey": item_key,
+            "prepareId": prepare_id,
+            "sourceDisplayName": source_display_name,
+            "status": "FAILED",
+            "error": {
+                "code": "PREPARED_WINDOW_PREVIEW_UNAVAILABLE",
+                "message": str(exc) or "MAIN preview cannot be read",
+            },
+            "timings": {
+                "cacheReadMs": round((time.perf_counter() - started) * 1000.0, 3),
+            },
+        }
+        label = TextContent(type="text", text=f"{item_key} — {source_display_name}: preview unavailable")
+        return structured, label, None
+
+
 def _batch_prepare_page_content(page: Dict[str, Any]) -> CallToolResult:
     """Convert an internal batch page into bounded model-visible content."""
 
@@ -981,6 +1160,96 @@ async def cancel_prepare_blend_assets(batch_prepare_id: str) -> CallToolResult:
     except Exception:
         logger.error("cancel_prepare_blend_assets failed with an internal error")
         return _prepare_blend_asset_error("BATCH_PREPARE_FAILED", "Batch prepare cancellation failed")
+
+
+@mcp.tool()
+async def inspect_prepared_assets(
+    batch_prepare_id: str,
+    items: List[Dict[str, str]],
+) -> CallToolResult:
+    """Return one bounded AI-ready window of compact facts plus adjacent MAIN previews."""
+
+    if not isinstance(items, list) or not items:
+        return _prepare_blend_asset_error(
+            "BATCH_PREPARE_WINDOW_ITEMS_REQUIRED",
+            "at least one prepared item is required",
+        )
+    if len(items) > _PREPARED_ASSET_WINDOW_MAX:
+        return _prepare_blend_asset_error(
+            "BATCH_PREPARE_WINDOW_TOO_LARGE",
+            f"prepared asset window cannot exceed {_PREPARED_ASSET_WINDOW_MAX} items",
+        )
+
+    normalized: list[Dict[str, str]] = []
+    for raw in items:
+        if not isinstance(raw, dict):
+            return _prepare_blend_asset_error(
+                "BATCH_PREPARE_WINDOW_ITEM_INVALID",
+                "each prepared asset window item must be an object",
+            )
+        item_key = raw.get("item_key") or raw.get("itemKey")
+        prepare_id = raw.get("prepare_id") or raw.get("prepareId")
+        if not isinstance(item_key, str) or not item_key:
+            return _prepare_blend_asset_error(
+                "BATCH_PREPARE_WINDOW_ITEM_KEY_REQUIRED",
+                "item_key is required",
+            )
+        if not isinstance(prepare_id, str) or not prepare_id:
+            return _prepare_blend_asset_error(
+                "BATCH_PREPARE_WINDOW_PREPARE_ID_REQUIRED",
+                "prepare_id is required",
+            )
+        normalized.append({"itemKey": item_key, "prepareId": prepare_id})
+
+    try:
+        window = get_asset_pipeline_manager().get_prepared_asset_window(
+            batch_prepare_id,
+            normalized,
+        )
+        started = time.perf_counter()
+        raw_items = window.get("items") if isinstance(window.get("items"), list) else []
+        resolved = await asyncio.gather(
+            *[
+                asyncio.to_thread(_prepared_window_item_content, raw_item)
+                for raw_item in raw_items
+                if isinstance(raw_item, dict)
+            ]
+        )
+
+        structured_items: list[Dict[str, Any]] = []
+        content: list[Any] = [
+            TextContent(
+                type="text",
+                text=f"Prepared asset window {batch_prepare_id}: {len(resolved)} item(s).",
+            )
+        ]
+        for structured, label, image_content in resolved:
+            structured_items.append(structured)
+            content.append(label)
+            if image_content is not None:
+                content.append(image_content)
+
+        return CallToolResult(
+            content=content,
+            structuredContent={
+                "batchPrepareId": batch_prepare_id,
+                "items": structured_items,
+                "timings": {
+                    "windowTotalMs": round((time.perf_counter() - started) * 1000.0, 3),
+                },
+            },
+            isError=False,
+        )
+    except AssetBatchError as exc:
+        return _prepare_blend_asset_error(exc.code, exc.message)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("inspect_prepared_assets failed")
+        return _prepare_blend_asset_error(
+            "PREPARED_WINDOW_FAILED",
+            "Prepared asset window could not be read",
+        )
 
 
 @mcp.tool()

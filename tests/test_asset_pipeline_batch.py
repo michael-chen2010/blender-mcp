@@ -595,3 +595,315 @@ def test_batch_mcp_status_mode_returns_no_preview_images(monkeypatch):
     assert "result" not in result.structuredContent["items"][0]
     assert [type(block) for block in result.content] == [TextContent]
 
+
+
+def test_prepared_asset_window_is_bounded_and_validates_batch_identity(tmp_path: Path):
+    store = PreparedArtifactStore(ttl_seconds=60)
+    manager = asset_pipeline.AssetPipelineManager(
+        artifact_store=store,
+        runtime_provider=lambda: BlenderRuntime("C:/Blender/blender.exe", "ENV"),
+        prepare_runner=_ready_runner(store),
+    )
+    items = [
+        _source(tmp_path / "window-a.blend", b"BLENDER-window-a"),
+        _source(tmp_path / "window-b.blend", b"BLENDER-window-b"),
+    ]
+
+    async def scenario():
+        started = await manager.start_prepare_blend_assets(items, "PUBLISH", "window-membership")
+        terminal = await _wait_terminal(manager, started["batchPrepareId"])
+        refs = [
+            {
+                "itemKey": item["itemKey"],
+                "prepareId": item["result"]["prepareId"],
+            }
+            for item in terminal["items"]
+        ]
+
+        window = manager.get_prepared_asset_window(started["batchPrepareId"], refs)
+        assert [item["itemKey"] for item in window["items"]] == [ref["itemKey"] for ref in refs]
+        assert all(item["result"]["prepareId"] == ref["prepareId"] for item, ref in zip(window["items"], refs))
+
+        with pytest.raises(asset_pipeline.AssetBatchError) as mismatch:
+            manager.get_prepared_asset_window(
+                started["batchPrepareId"],
+                [{"itemKey": refs[0]["itemKey"], "prepareId": refs[1]["prepareId"]}],
+            )
+        assert mismatch.value.code == "BATCH_PREPARE_WINDOW_IDENTITY_MISMATCH"
+
+        with pytest.raises(asset_pipeline.AssetBatchError) as too_large:
+            manager.get_prepared_asset_window(
+                started["batchPrepareId"],
+                [
+                    {"itemKey": f"item-{index}", "prepareId": f"prepare-{index}"}
+                    for index in range(17)
+                ],
+            )
+        assert too_large.value.code == "BATCH_PREPARE_WINDOW_TOO_LARGE"
+        await manager.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_batch_mcp_inspect_prepared_assets_returns_compact_item_keyed_previews(monkeypatch, tmp_path: Path):
+    from blender_mcp import server
+
+    preview_a = tmp_path / "window-a.png"
+    preview_b = tmp_path / "window-b.png"
+    preview_a.write_bytes(PNG_BYTES + b"window-a")
+    preview_b.write_bytes(PNG_BYTES + b"window-b")
+
+    class FakeManager:
+        def get_prepared_asset_window(self, batch_prepare_id, items):
+            assert batch_prepare_id == "batch-window"
+            assert items == [
+                {"itemKey": "item-a", "prepareId": "prepare-a"},
+                {"itemKey": "item-b", "prepareId": "prepare-b"},
+            ]
+            return {
+                "batchPrepareId": "batch-window",
+                "items": [
+                    {
+                        "itemKey": "item-a",
+                        "sourceDisplayName": "a.blend",
+                        "sourceFingerprint": "1" * 64,
+                        "result": {
+                            "prepareId": "prepare-a",
+                            "observation": {
+                                "schemaVersion": 1,
+                                "analyzerVersion": "test-analyzer",
+                                "observationScope": "SOURCE_ASSET",
+                                "source": {"displayName": "a.blend"},
+                                "structure": {"objectCount": 2},
+                                "geometry": {
+                                    "vertexCount": 10,
+                                    "triangleCount": 12,
+                                    "dimensionsMeters": {"x": 1.0, "y": 2.0, "z": 3.0},
+                                    "hasUv": True,
+                                },
+                                "materials": {
+                                    "materialCount": 1,
+                                    "materialWorkflow": "PBR",
+                                    "pbrChannels": ["base_color", "roughness"],
+                                },
+                                "deformation": {"rigged": False, "animated": False},
+                                "evidenceSummary": {
+                                    "objectNames": ["Body", "Cap"],
+                                    "materialNames": ["Plastic"],
+                                },
+                            },
+                            "artifacts": [
+                                {
+                                    "artifact_id": "preview-a",
+                                    "kind": "PREVIEW",
+                                    "size": 10,
+                                    "sha256": "a" * 64,
+                                    "content_type": "image/png",
+                                    "expires_at": "later",
+                                }
+                            ],
+                            "validation": {"status": "PASSED"},
+                        },
+                    },
+                    {
+                        "itemKey": "item-b",
+                        "sourceDisplayName": "b.blend",
+                        "sourceFingerprint": "2" * 64,
+                        "result": {
+                            "prepareId": "prepare-b",
+                            "observation": {
+                                "schemaVersion": 1,
+                                "analyzerVersion": "test-analyzer",
+                                "structure": {"objectCount": 1},
+                                "geometry": {"triangleCount": 20},
+                                "materials": {"materialCount": 0, "pbrChannels": []},
+                                "deformation": {"rigged": True, "animated": True},
+                                "evidenceSummary": {"objectNames": ["Character"], "materialNames": []},
+                            },
+                            "artifacts": [
+                                {
+                                    "artifact_id": "preview-b",
+                                    "kind": "PREVIEW",
+                                    "size": 11,
+                                    "sha256": "b" * 64,
+                                    "content_type": "image/png",
+                                    "expires_at": "later",
+                                }
+                            ],
+                            "validation": {"status": "PASSED"},
+                        },
+                    },
+                ],
+            }
+
+    class FakeLease:
+        def __enter__(self):
+            return tmp_path
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    import threading
+
+    resolve_barrier = threading.Barrier(2, timeout=2.0)
+
+    class FakeStore:
+        def lease(self, prepare_id):
+            assert prepare_id in {"prepare-a", "prepare-b"}
+            return FakeLease()
+
+        def resolve(self, artifact_id: str) -> Path:
+            resolve_barrier.wait()
+            return {"preview-a": preview_a, "preview-b": preview_b}[artifact_id]
+
+        def evidence_identity(self, prepare_id: str):
+            raise AssertionError("AI-ready window must not re-hash retained .blend evidence")
+
+    monkeypatch.setattr(server, "get_asset_pipeline_manager", lambda: FakeManager(), raising=False)
+    monkeypatch.setattr(server, "get_prepared_artifact_store", lambda: FakeStore())
+
+    result = asyncio.run(
+        server.mcp.call_tool(
+            "inspect_prepared_assets",
+            {
+                "batch_prepare_id": "batch-window",
+                "items": [
+                    {"item_key": "item-a", "prepare_id": "prepare-a"},
+                    {"item_key": "item-b", "prepare_id": "prepare-b"},
+                ],
+            },
+        )
+    )
+
+    assert isinstance(result, CallToolResult)
+    assert result.isError is False
+    assert [item["itemKey"] for item in result.structuredContent["items"]] == ["item-a", "item-b"]
+    first = result.structuredContent["items"][0]
+    assert "observation" not in first
+    assert first["compactObservation"]["objectCount"] == 2
+    assert first["compactObservation"]["triangleCount"] == 12
+    assert first["compactObservation"]["primaryObjectNames"] == ["Body", "Cap"]
+    assert first["preparedArtifacts"]["mainPreview"]["artifactId"] == "preview-a"
+    assert "base64" not in repr(result.structuredContent).lower()
+    assert [type(block) for block in result.content] == [
+        TextContent,
+        TextContent,
+        ImageContent,
+        TextContent,
+        ImageContent,
+    ]
+    assert result.content[1].text.startswith("item-a")
+    assert result.content[3].text.startswith("item-b")
+
+
+def test_batch_mcp_inspect_prepared_assets_rejects_more_than_sixteen_items():
+    from blender_mcp import server
+
+    result = asyncio.run(
+        server.mcp.call_tool(
+            "inspect_prepared_assets",
+            {
+                "batch_prepare_id": "batch-window",
+                "items": [
+                    {"item_key": f"item-{index}", "prepare_id": f"prepare-{index}"}
+                    for index in range(17)
+                ],
+            },
+        )
+    )
+
+    assert isinstance(result, CallToolResult)
+    assert result.isError is True
+    assert result.structuredContent["error"]["code"] == "BATCH_PREPARE_WINDOW_TOO_LARGE"
+
+
+
+def test_batch_mcp_inspect_prepared_assets_isolates_preview_failure(monkeypatch, tmp_path: Path):
+    from blender_mcp import server
+    from blender_mcp.prepared_artifacts import PreparedArtifactError
+
+    preview_ok = tmp_path / "window-ok.png"
+    preview_ok.write_bytes(PNG_BYTES + b"ok")
+
+    def raw_item(item_key: str, prepare_id: str, preview_id: str):
+        return {
+            "itemKey": item_key,
+            "sourceDisplayName": f"{item_key}.blend",
+            "sourceFingerprint": item_key[-1] * 64,
+            "result": {
+                "prepareId": prepare_id,
+                "observation": {
+                    "structure": {"objectCount": 1},
+                    "geometry": {"triangleCount": 2},
+                    "materials": {"materialCount": 0, "pbrChannels": []},
+                    "deformation": {"rigged": False, "animated": False},
+                },
+                "artifacts": [
+                    {
+                        "artifact_id": preview_id,
+                        "kind": "PREVIEW",
+                        "size": 10,
+                        "sha256": item_key[-1] * 64,
+                        "content_type": "image/png",
+                        "expires_at": "later",
+                    }
+                ],
+            },
+        }
+
+    class FakeManager:
+        def get_prepared_asset_window(self, batch_prepare_id, items):
+            return {
+                "batchPrepareId": batch_prepare_id,
+                "items": [
+                    raw_item("item-a", "prepare-a", "preview-ok"),
+                    raw_item("item-b", "prepare-b", "preview-expired"),
+                ],
+            }
+
+    class FakeLease:
+        def __enter__(self):
+            return tmp_path
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeStore:
+        def lease(self, prepare_id):
+            return FakeLease()
+
+        def resolve(self, artifact_id):
+            if artifact_id == "preview-expired":
+                raise PreparedArtifactError(
+                    "PREPARED_ARTIFACT_EXPIRED",
+                    "preview expired",
+                )
+            return preview_ok
+
+    monkeypatch.setattr(server, "get_asset_pipeline_manager", lambda: FakeManager(), raising=False)
+    monkeypatch.setattr(server, "get_prepared_artifact_store", lambda: FakeStore())
+
+    result = asyncio.run(
+        server.mcp.call_tool(
+            "inspect_prepared_assets",
+            {
+                "batch_prepare_id": "batch-window",
+                "items": [
+                    {"item_key": "item-a", "prepare_id": "prepare-a"},
+                    {"item_key": "item-b", "prepare_id": "prepare-b"},
+                ],
+            },
+        )
+    )
+
+    assert result.isError is False
+    assert result.structuredContent["items"][0]["status"] == "READY"
+    assert result.structuredContent["items"][1]["status"] == "FAILED"
+    assert result.structuredContent["items"][1]["error"]["code"] == "PREPARED_ARTIFACT_EXPIRED"
+    assert [type(block) for block in result.content] == [
+        TextContent,
+        TextContent,
+        ImageContent,
+        TextContent,
+    ]
+
