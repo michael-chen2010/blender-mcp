@@ -1164,6 +1164,8 @@ def export_viewer_glb(bpy: Any, target: str | Path) -> dict[str, Any]:
             export_apply=False,
             export_draco_mesh_compression_enable=True,
             export_draco_mesh_compression_level=6,
+            export_image_format="WEBP",
+            export_image_quality=90,
         )
     except Exception as error:  # viewer export must never break a publish
         return {"status": "FAILED", "error": f"{type(error).__name__}: {error}"}
