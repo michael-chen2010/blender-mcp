@@ -1152,6 +1152,26 @@ def pack_self_contained(bpy: Any) -> dict[str, Any]:
     return {"selfContained": True, "linkedLibraryCount": 0, "unpackedImageCount": 0}
 
 
+def export_viewer_glb(bpy: Any, target: str | Path) -> dict[str, Any]:
+    """Export a derived viewer file. glTF is metres by spec, so the unit conversion happens
+    here only; the authoritative *.blend payload keeps the authoring units untouched."""
+    path = Path(target)
+    try:
+        bpy.ops.export_scene.gltf(
+            filepath=str(path),
+            export_format="GLB",
+            use_selection=False,
+            export_apply=False,
+            export_draco_mesh_compression_enable=True,
+            export_draco_mesh_compression_level=6,
+        )
+    except Exception as error:  # viewer export must never break a publish
+        return {"status": "FAILED", "error": f"{type(error).__name__}: {error}"}
+    if not path.is_file():
+        return {"status": "FAILED", "error": "glTF exporter produced no file"}
+    return {"status": "OK", "path": str(path), "size": path.stat().st_size}
+
+
 def write_publish_payload(bpy: Any, payload_path: str | Path) -> None:
     target = Path(payload_path)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -1436,6 +1456,10 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
             write_publish_payload(bpy, payload_path)
             payload_write_ms = _elapsed_ms(payload_write_started)
 
+            viewer_started = time.perf_counter()
+            viewer_result = export_viewer_glb(bpy, Path(payload_path).with_suffix(".glb"))
+            viewer_ms = _elapsed_ms(viewer_started)
+
             payload_reopen_started = time.perf_counter()
             bpy.ops.wm.open_mainfile(filepath=payload_path)
             payload_reopen_ms = _elapsed_ms(payload_reopen_started)
@@ -1480,6 +1504,22 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
             observation["payloadEvidence"] = payload_evidence
             result["payloadPath"] = payload_path
             result["payloadEvidence"] = payload_evidence
+            result["viewer"] = viewer_result
+            if viewer_result.get("status") == "OK":
+                viewer_file = Path(str(viewer_result["path"]))
+                result["viewerPath"] = str(viewer_file)
+                result["viewerEvidence"] = {
+                    "format": "GLB",
+                    "sha256": _file_sha256(viewer_file),
+                    "size": viewer_file.stat().st_size,
+                    "derivedFromPayloadSha256": payload_sha256,
+                    "compression": "DRACO",
+                    # glTF positions stay in authoring units; node transforms carry the
+                    # conversion, so the viewer-space box must match these metres.
+                    "expectedDimensionsMeters": observation.get("geometry", {}).get(
+                        "dimensionsMeters"
+                    ),
+                }
             result["validation"] = validation
             timings.update(
                 {
