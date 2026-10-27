@@ -597,6 +597,15 @@ def _real_mesh_inspector(bpy: Any) -> Callable[[Any, float], dict[str, Any]]:
     return inspect
 
 
+def _unit_name(scale_length: float) -> str:
+    """Name the authoring unit without touching geometry (1 unit = scale_length meters)."""
+    known = {1.0: "METERS", 0.01: "CENTIMETERS", 0.001: "MILLIMETERS"}
+    for value, name in known.items():
+        if abs(scale_length - value) <= 1e-9:
+            return name
+    return f"CUSTOM:{scale_length:g}"
+
+
 def extract_observation(
     bpy: Any,
     *,
@@ -648,6 +657,12 @@ def extract_observation(
         },
         "structure": structure,
         "geometry": geometry,
+        "units": {
+            "scaleLength": scale_length,
+            "name": _unit_name(scale_length),
+            "lengthUnit": str(getattr(unit_settings, "length_unit", "") or ""),
+            "system": str(getattr(unit_settings, "system", "") or ""),
+        },
         "materials": materials,
         "deformation": deformation,
         "evidenceSummary": {
@@ -844,16 +859,10 @@ def normalize_publish_context(bpy: Any) -> list[Any]:
             scene.collection.children.unlink(collection)
 
     unit_settings = scene.unit_settings
-    source_scale = float(getattr(unit_settings, "scale_length", 1.0) or 1.0)
     top_level = [obj for obj in targets if getattr(obj, "parent", None) not in targets]
-    if source_scale != 1.0:
-        for obj in top_level:
-            obj.location = tuple(float(value) * source_scale for value in obj.location)
-            obj.scale = tuple(float(value) * source_scale for value in obj.scale)
+    # 保留作者的建模单位（米/厘米/毫米）：不缩放几何、不改 scale_length、不烘焙变换。
+    # 尺寸在 inspection 阶段乘 scale_length 统一换算成米上报，几何保持零修改。
     unit_settings.system = "METRIC"
-    unit_settings.length_unit = "METERS"
-    unit_settings.scale_length = 1.0
-    _apply_publish_object_scales(bpy, targets)
 
     bounds = _evaluated_bounds(bpy, targets)
     if bounds is not None:
@@ -1197,6 +1206,13 @@ def compare_publish_facts(
             "Final payload facts differ from prepared publish facts: "
             + json.dumps(mismatches, ensure_ascii=False, sort_keys=True),
         )
+    per_object = _object_dimension_mismatches(expected, reopened, dimension_tolerance)
+    if per_object:
+        raise PublishValidationError(
+            "PAYLOAD_OBJECT_DIMENSION_MISMATCH",
+            "Reopened payload changed individual object sizes: "
+            + json.dumps(per_object, ensure_ascii=False, sort_keys=True),
+        )
     return {
         "status": "PASSED",
         "factsVerifiedAfterReopen": True,
@@ -1205,10 +1221,55 @@ def compare_publish_facts(
             "structure.objectCount",
             "geometry.triangleCount",
             "geometry.dimensionsMeters",
+            "structure.objects[].dimensionsMeters",
             "materials.materialCount",
             "materials.materialWorkflow",
         ],
     }
+
+
+def _object_dimension_mismatches(
+    expected: dict[str, Any],
+    reopened: dict[str, Any],
+    tolerance: float,
+) -> list[dict[str, Any]]:
+    """Every object must keep its size: only a top-level bbox check misses shrunk parts."""
+
+    def by_name(observation: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        detail = observation.get("structure", {}).get("objects")
+        if isinstance(detail, dict):
+            return {str(name): item for name, item in detail.items() if isinstance(item, dict)}
+        if isinstance(detail, list):
+            return {
+                str(item.get("name")): item
+                for item in detail
+                if isinstance(item, dict) and item.get("name") is not None
+            }
+        return {}
+
+    before_objects = by_name(expected)
+    after_objects = by_name(reopened)
+    mismatches: list[dict[str, Any]] = []
+    for name, before in before_objects.items():
+        after = after_objects.get(name)
+        if after is None:
+            mismatches.append({"object": name, "field": "missing"})
+            continue
+        before_dimensions = before.get("dimensionsMeters") or {}
+        after_dimensions = after.get("dimensionsMeters") or {}
+        for axis in ("x", "y", "z"):
+            left = float(before_dimensions.get(axis, 0.0) or 0.0)
+            right = float(after_dimensions.get(axis, 0.0) or 0.0)
+            if abs(left - right) > tolerance:
+                mismatches.append(
+                    {
+                        "object": name,
+                        "field": f"dimensionsMeters.{axis}",
+                        "expected": left,
+                        "actual": right,
+                    }
+                )
+    return mismatches
 
 
 def _write_json(path: str | Path, payload: dict[str, Any]) -> None:
