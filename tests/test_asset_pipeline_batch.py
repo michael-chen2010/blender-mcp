@@ -515,9 +515,13 @@ def test_batch_mcp_get_returns_item_labels_and_adjacent_images(monkeypatch, tmp_
     assert result.isError is False
     assert result.structuredContent["items"][0]["itemKey"] == "item-a"
     assert result.structuredContent["items"][0]["result"]["artifacts"][0]["artifactId"] == "preview-a"
-    assert [type(block) for block in result.content] == [TextContent, TextContent, ImageContent, TextContent, ImageContent]
+    # content = [batch header, (label, MAIN image, handle line) per READY item]
+    kinds = [type(block) for block in result.content]
+    assert kinds == [TextContent, TextContent, ImageContent, TextContent, TextContent, ImageContent, TextContent]
     assert result.content[1].text == "item-a — a.blend"
-    assert result.content[3].text == "item-b — b.blend"
+    assert "artifactId=preview-a" in result.content[3].text
+    assert result.content[4].text == "item-b — b.blend"
+    assert "artifactId=preview-b" in result.content[6].text
 
 
 def test_batch_status_mode_is_lightweight_and_keeps_ready_identity(tmp_path: Path):

@@ -185,6 +185,7 @@ def prepare_blend_file(
     source_kind: str = "BLEND_FILE",
     prepare_id: str | None = None,
     artifact_store: PreparedArtifactStore | None = None,
+    preview_options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Prepare one source .blend in an isolated background Blender process.
 
@@ -232,6 +233,8 @@ def prepare_blend_file(
         "resultPath": str(result_path),
         "observationCachePath": str(observation_cache_path),
     }
+    if preview_options:
+        job["previewOptions"] = preview_options
     _write_job(job_path, job)
 
     command = [

@@ -185,12 +185,55 @@ def test_mcp_result_contains_structured_data_text_summary_and_main_image(monkeyp
 
     assert len(result.content) == 2
     assert isinstance(result.content[0], TextContent)
-    assert "prepare-123" in result.content[0].text
-    assert "METADATA" in result.content[0].text
-    assert len(result.content[0].text) < 500
+    summary_text = result.content[0].text
+    assert "prepare-123" in summary_text
+    assert "METADATA" in summary_text
+    # Text-only clients cannot see structuredContent, so the handle must be in text.
+    assert "artifactId=preview-opaque" in summary_text
+    assert structured["artifacts"][0]["sha256"] in summary_text
+    assert len(summary_text) < 800
     assert isinstance(result.content[1], ImageContent)
     assert result.content[1].mimeType == "image/png"
     assert base64.b64decode(result.content[1].data) == PNG_BYTES
+
+
+def test_preview_overrides_are_forwarded_to_the_worker(monkeypatch, tmp_path: Path):
+    source = tmp_path / "asset.blend"
+    source.write_bytes(b"BLENDER-source")
+    ready, preview_path = _ready_result(tmp_path)
+    store = _FakeArtifactStore(preview_path)
+    seen: dict = {}
+
+    def fake_prepare(_path, **kwargs):
+        seen.update(kwargs)
+        return ready
+
+    monkeypatch.setattr(server, "prepare_blend_file", fake_prepare, raising=False)
+    monkeypatch.setattr(server, "get_prepared_artifact_store", lambda: store, raising=False)
+
+    result = _call_tool(
+        {
+            "source": {"kind": "BLEND_FILE", "path": str(source)},
+            "profile": "PUBLISH",
+            "overrides": {
+                "preview": {
+                    "width": 768,
+                    "height": 768,
+                    "engine": "cycles",
+                    "samples": 96,
+                    "views": ["MAIN"],
+                }
+            },
+        }
+    )
+
+    assert result.isError is False
+    assert seen["preview_options"] == {
+        "width": 768,
+        "height": 768,
+        "engine": "CYCLES",
+        "samples": 96,
+    }
 
 
 @pytest.mark.parametrize(
@@ -212,7 +255,7 @@ def test_mcp_result_contains_structured_data_text_summary_and_main_image(monkeyp
             {
                 "source": {"kind": "CURRENT_SELECTION"},
                 "profile": "METADATA",
-                "overrides": {"preview": {"width": 256, "height": 256, "views": ["MAIN"]}},
+                "overrides": {"preview": {"views": ["MAIN", "FRONT"]}},
             },
             "PREPARE_OVERRIDE_UNSUPPORTED",
         ),

@@ -37,6 +37,7 @@ def test_run_job_opens_source_once_and_records_stage_timings(monkeypatch, tmp_pa
         )
     )
     monkeypatch.setattr(worker, "_import_bpy", lambda: fake_bpy)
+    monkeypatch.setattr(worker, "normalize_publish_context", lambda _bpy: [])
     monkeypatch.setattr(
         worker,
         "extract_observation",
@@ -48,7 +49,10 @@ def test_run_job_opens_source_once_and_records_stage_timings(monkeypatch, tmp_pa
         },
     )
 
-    def render(_bpy, _observation, output_path):
+    render_calls = []
+
+    def render(_bpy, _observation, output_path, preview_options=None):
+        render_calls.append(preview_options)
         Path(output_path).write_bytes(b"\x89PNG\r\n\x1a\npreview")
         return {"width": 512, "height": 512, "view": "THREE_QUARTER"}
 
@@ -62,8 +66,12 @@ def test_run_job_opens_source_once_and_records_stage_timings(monkeypatch, tmp_pa
             "sourceKind": "BLEND_FILE",
             "previewPath": str(preview),
             "resultPath": str(result_path),
+            "previewOptions": {"width": 640, "engine": "CYCLES", "samples": 32},
         }
     )
+
+    assert render_calls == [{"width": 640, "engine": "CYCLES", "samples": 32}]
+    assert result["previewOptions"] == {"width": 640, "engine": "CYCLES", "samples": 32}
 
     assert open_calls == [str(source)]
     assert result["observation"]["prepareId"] == "prepare-1"

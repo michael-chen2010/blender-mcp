@@ -577,69 +577,104 @@ def _validate_prepare_source(source: Dict[str, Any]) -> tuple[str, Path | None]:
     )
 
 
-def _validate_prepare_overrides(overrides: Dict[str, Any] | None) -> None:
+def _normalize_prepare_overrides(overrides: Dict[str, Any] | None) -> Dict[str, Any]:
+    """Validate prepare overrides and return the options the worker consumes.
+
+    Only preview rendering is tunable today (resolution, engine, samples, and the
+    MAIN view). The three profile booleans stay rejected rather than silently
+    ignored. Supplemental views remain the worker's Task 5a.
+    """
     if overrides is None or overrides == {}:
-        return
+        return {}
     if not isinstance(overrides, dict):
         raise _PrepareBlendAssetInputError(
             "PREPARE_INVALID_OVERRIDES", "overrides must be an object"
         )
 
-    allowed = {"preview", "includeAnimationDetails", "preparePayload", "runValidation"}
+    allowed = {"preview"}
     unknown = set(overrides) - allowed
     if unknown:
         raise _PrepareBlendAssetInputError(
             "PREPARE_INVALID_OVERRIDES",
-            f"unsupported override field(s): {', '.join(sorted(unknown))}",
+            f"unsupported override field(s): {', '.join(sorted(unknown))}"
+            " (per-profile booleans are still not consumed by the worker)",
         )
 
-    for key in ("includeAnimationDetails", "preparePayload", "runValidation"):
-        if key in overrides and not isinstance(overrides[key], bool):
-            raise _PrepareBlendAssetInputError(
-                "PREPARE_INVALID_OVERRIDES", f"overrides.{key} must be boolean"
-            )
-
     preview = overrides.get("preview")
-    if preview is not None:
-        if not isinstance(preview, dict):
-            raise _PrepareBlendAssetInputError(
-                "PREPARE_INVALID_OVERRIDES", "overrides.preview must be an object"
-            )
-        preview_unknown = set(preview) - {"width", "height", "views"}
-        if preview_unknown:
-            raise _PrepareBlendAssetInputError(
-                "PREPARE_INVALID_OVERRIDES",
-                "unsupported preview override field(s): "
-                + ", ".join(sorted(preview_unknown)),
-            )
-        for dimension in ("width", "height"):
-            if dimension in preview:
-                value = preview[dimension]
-                if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                    raise _PrepareBlendAssetInputError(
-                        "PREPARE_INVALID_OVERRIDES",
-                        f"overrides.preview.{dimension} must be a positive integer",
-                    )
-        if "views" in preview:
-            views = preview["views"]
-            supported_views = {"MAIN", "FRONT", "BACK", "LEFT", "RIGHT", "TOP"}
-            if (
-                not isinstance(views, list)
-                or not views
-                or any(not isinstance(view, str) or view not in supported_views for view in views)
-            ):
+    if preview is None:
+        return {}
+    if not isinstance(preview, dict):
+        raise _PrepareBlendAssetInputError(
+            "PREPARE_INVALID_OVERRIDES", "overrides.preview must be an object"
+        )
+    preview_unknown = set(preview) - {"width", "height", "views", "engine", "samples"}
+    if preview_unknown:
+        raise _PrepareBlendAssetInputError(
+            "PREPARE_INVALID_OVERRIDES",
+            "unsupported preview override field(s): "
+            + ", ".join(sorted(preview_unknown)),
+        )
+
+    options: Dict[str, Any] = {}
+    for dimension in ("width", "height"):
+        if dimension in preview:
+            value = preview[dimension]
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise _PrepareBlendAssetInputError(
                     "PREPARE_INVALID_OVERRIDES",
-                    "overrides.preview.views must contain supported view names",
+                    f"overrides.preview.{dimension} must be a positive integer",
                 )
+            if value > 4096:
+                raise _PrepareBlendAssetInputError(
+                    "PREPARE_INVALID_OVERRIDES",
+                    f"overrides.preview.{dimension} must not exceed 4096",
+                )
+            options[dimension] = value
 
-    # The current worker has deterministic profile presets but does not yet consume
-    # per-request overrides. Rejecting non-empty values is safer than silently
-    # accepting settings that would have no effect. Supplemental views are Task 5a.
-    raise _PrepareBlendAssetInputError(
-        "PREPARE_OVERRIDE_UNSUPPORTED",
-        "non-empty overrides are not supported by the current prepare worker",
-    )
+    if "engine" in preview:
+        engine = preview["engine"]
+        if not isinstance(engine, str) or engine.upper() not in {"EEVEE", "CYCLES"}:
+            raise _PrepareBlendAssetInputError(
+                "PREPARE_INVALID_OVERRIDES",
+                "overrides.preview.engine must be EEVEE or CYCLES",
+            )
+        options["engine"] = engine.upper()
+
+    if "samples" in preview:
+        samples = preview["samples"]
+        if isinstance(samples, bool) or not isinstance(samples, int) or samples <= 0:
+            raise _PrepareBlendAssetInputError(
+                "PREPARE_INVALID_OVERRIDES",
+                "overrides.preview.samples must be a positive integer",
+            )
+        if samples > 2048:
+            raise _PrepareBlendAssetInputError(
+                "PREPARE_INVALID_OVERRIDES",
+                "overrides.preview.samples must not exceed 2048",
+            )
+        options["samples"] = samples
+
+    if "views" in preview:
+        views = preview["views"]
+        supported_views = {"MAIN", "FRONT", "BACK", "LEFT", "RIGHT", "TOP"}
+        if (
+            not isinstance(views, list)
+            or not views
+            or any(not isinstance(view, str) or view not in supported_views for view in views)
+        ):
+            raise _PrepareBlendAssetInputError(
+                "PREPARE_INVALID_OVERRIDES",
+                "overrides.preview.views must contain supported view names",
+            )
+        extras = [view for view in views if view != "MAIN"]
+        if extras:
+            raise _PrepareBlendAssetInputError(
+                "PREPARE_OVERRIDE_UNSUPPORTED",
+                "additional preview views are not rendered yet; use"
+                " render_prepared_asset_view for supplemental evidence",
+            )
+
+    return options
 
 
 def _prepare_blend_asset_content(result: Dict[str, Any], profile: str) -> CallToolResult:
@@ -705,6 +740,18 @@ def _prepare_blend_asset_content(result: Dict[str, Any], profile: str) -> CallTo
         f"Prepared Blender asset {prepare_id} with profile {profile}{object_summary}; "
         f"{len(artifacts)} prepared artifact(s)."
     )
+    # Text-only MCP clients project `content` but not `structuredContent`; without
+    # these lines they cannot resolve an artifact handle for upload_prepared_artifact.
+    for artifact in artifacts:
+        summary += (
+            f"\n- {artifact['kind']} artifactId={artifact['artifactId']}"
+            f" size={artifact['size']} sha256={artifact['sha256']}"
+            f" mimeType={artifact['mimeType']} expiresAt={artifact['expiresAt']}"
+        )
+    summary += (
+        "\nUpload with upload_prepared_artifact(artifact_id, method, signed_url,"
+        " expected_size, expected_sha256); handles are short-lived."
+    )
     return CallToolResult(
         content=[
             TextContent(type="text", text=summary),
@@ -734,7 +781,7 @@ async def prepare_blend_asset(
                 "PREPARE_INVALID_PROFILE",
                 f"profile must be one of {', '.join(SUPPORTED_ASSET_PROFILES)}",
             )
-        _validate_prepare_overrides(overrides)
+        _preview_options = _normalize_prepare_overrides(overrides)
         runtime = _resolve_server_asset_runtime()
 
         if source_kind == "BLEND_FILE":
@@ -745,6 +792,7 @@ async def prepare_blend_asset(
                     profile=profile,
                     source_kind="BLEND_FILE",
                     runtime=runtime,
+                    preview_options=_preview_options,
                 )
             return _prepare_blend_asset_content(prepared, profile)
 
@@ -768,6 +816,7 @@ async def prepare_blend_asset(
                     profile=profile,
                     source_kind="CURRENT_SELECTION",
                     runtime=runtime,
+                    preview_options=_preview_options,
                 )
             return _prepare_blend_asset_content(prepared, profile)
     except _PrepareBlendAssetInputError as exc:
@@ -1095,6 +1144,22 @@ def _batch_prepare_page_content(page: Dict[str, Any]) -> CallToolResult:
             label = f"{public_item.get('itemKey')} — {public_item.get('sourceDisplayName')}"
             content.append(TextContent(type="text", text=label))
             content.append(Image(path=preview_path, format="png").to_image_content())
+            # Text-only clients project `content` but not `structuredContent`, so
+            # batch uploads need the handles spelled out here as well.
+            handles = public_item.get("result", {}).get("artifacts") or []
+            for artifact in handles:
+                content.append(
+                    TextContent(
+                        type="text",
+                        text=(
+                            f"{public_item.get('itemKey')} {artifact['kind']}"
+                            f" artifactId={artifact['artifactId']}"
+                            f" size={artifact['size']} sha256={artifact['sha256']}"
+                            f" mimeType={artifact['mimeType']}"
+                            f" expiresAt={artifact['expiresAt']}"
+                        ),
+                    )
+                )
     return CallToolResult(content=content, structuredContent=public_page, isError=False)
 
 

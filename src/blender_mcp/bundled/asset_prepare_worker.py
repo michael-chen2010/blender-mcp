@@ -17,7 +17,7 @@ SUPPORTED_PROFILES = ("PREVIEW", "METADATA", "PUBLISH")
 WORKER_PROTOCOL_VERSION = 4
 OBSERVATION_SCHEMA_VERSION = 1
 ANALYZER_VERSION = "blender-mcp-observation-v1"
-PREVIEW_PRESET_VERSION = "asset-preview-v1"
+PREVIEW_PRESET_VERSION = "asset-preview-v2"
 OBJECT_DETAIL_LIMIT = 50
 MATERIAL_DETAIL_LIMIT = 30
 PREVIEW_WIDTH = 512
@@ -896,7 +896,85 @@ def _aim_at(obj: Any, target: Any) -> None:
     obj.rotation_euler = direction.to_track_quat("-Z", "Y").to_euler()
 
 
-def render_preview_view(bpy: Any, output_path: str, view: str) -> dict[str, Any]:
+SUPPORTED_PREVIEW_ENGINES = ("EEVEE", "CYCLES")
+_DEFAULT_EEVEE_SAMPLES = 64
+_DEFAULT_CYCLES_SAMPLES = 48
+
+
+def _configure_color_management(bpy: Any, scene: Any) -> dict[str, Any]:
+    """Keep the render faithful instead of dim: AgX + a small exposure lift."""
+    settings = getattr(scene, "view_settings", None)
+    applied: dict[str, Any] = {}
+    if settings is None:
+        return applied
+    for transform in ("AgX", "Filmic", "Standard"):
+        try:
+            settings.view_transform = transform
+            applied["viewTransform"] = transform
+            break
+        except Exception:
+            continue
+    for look in ("AgX - Medium High Contrast", "Medium High Contrast", "None"):
+        try:
+            settings.look = look
+            applied["look"] = look
+            break
+        except Exception:
+            continue
+    try:
+        settings.exposure = 0.0
+        applied["exposure"] = 0.0
+    except Exception:
+        pass
+    try:
+        settings.gamma = 1.0
+        applied["gamma"] = 1.0
+    except Exception:
+        pass
+    return applied
+
+
+def _apply_render_engine(bpy: Any, scene: Any, engine: str, samples: int) -> str:
+    """Select the render engine and sample budget; returns the engine actually used."""
+    if engine == "CYCLES":
+        scene.render.engine = "CYCLES"
+        cycles = getattr(scene, "cycles", None)
+        if cycles is not None:
+            cycles.device = "CPU"
+            cycles.samples = samples
+            cycles.use_denoising = True
+        return "CYCLES"
+
+    used = "EEVEE"
+    for candidate in ("BLENDER_EEVEE_NEXT", "BLENDER_EEVEE"):
+        try:
+            scene.render.engine = candidate
+            used = candidate
+            break
+        except Exception:
+            continue
+    eevee = getattr(scene, "eevee", None)
+    if eevee is not None:
+        # EEVEE Next only lights materials properly with ray tracing enabled.
+        if hasattr(eevee, "use_raytracing"):
+            eevee.use_raytracing = True
+        if hasattr(eevee, "use_shadows"):
+            eevee.use_shadows = True
+        if hasattr(eevee, "taa_render_samples"):
+            eevee.taa_render_samples = samples
+    return used
+
+
+def render_preview_view(
+    bpy: Any,
+    output_path: str,
+    view: str,
+    *,
+    width: int | None = None,
+    height: int | None = None,
+    engine: str | None = None,
+    samples: int | None = None,
+) -> dict[str, Any]:
     """Render one deterministic evidence view without saving the modified scene."""
     from mathutils import Vector  # type: ignore
 
@@ -910,6 +988,17 @@ def render_preview_view(bpy: Any, output_path: str, view: str) -> dict[str, Any]
     }
     if view not in directions:
         raise ValueError(f"Unsupported preview view: {view}")
+
+    render_width = int(width) if width else PREVIEW_WIDTH
+    render_height = int(height) if height else PREVIEW_HEIGHT
+    # Cycles is the default: EEVEE flattens this asset class into a grey card and
+    # costs about the same wall time on single assets (sub-second at 512px).
+    engine_name = (engine or "CYCLES").upper()
+    if engine_name not in SUPPORTED_PREVIEW_ENGINES:
+        raise ValueError(f"Unsupported preview engine: {engine}")
+    sample_count = int(samples) if samples else (
+        _DEFAULT_CYCLES_SAMPLES if engine_name == "CYCLES" else _DEFAULT_EEVEE_SAMPLES
+    )
 
     scene = bpy.context.scene
     center, max_dimension = _preview_world_bounds(bpy)
@@ -939,7 +1028,10 @@ def render_preview_view(bpy: Any, output_path: str, view: str) -> dict[str, Any]
         ("FILL", Vector((-1.5, -0.6, 1.2)), 500.0, 2.2),
         ("RIM", Vector((0.4, 1.8, 2.0)), 700.0, 1.6),
     )
-    energy_scale = max(0.5, min(4.0, math.sqrt(max_dimension)))
+    # Area-light power must track distance squared: the rig sits at a fixed
+    # multiple of the asset size, so a fixed wattage makes large assets dark and
+    # flat. This keeps illuminance roughly constant across asset scales.
+    energy_scale = max(0.25, max_dimension ** 2) * 0.22
     for label, offset, energy, size_scale in light_specs:
         light_data = bpy.data.lights.new(f"__BLENDERMCP_PREVIEW_{label}_DATA__", "AREA")
         light_data.energy = energy * energy_scale
@@ -957,20 +1049,15 @@ def render_preview_view(bpy: Any, output_path: str, view: str) -> dict[str, Any]
         color_input = background.inputs.get("Color")
         strength_input = background.inputs.get("Strength")
         if color_input is not None:
-            color_input.default_value = (0.055, 0.055, 0.055, 1.0)
+            color_input.default_value = (0.16, 0.16, 0.17, 1.0)
         if strength_input is not None:
-            strength_input.default_value = 0.35
+            strength_input.default_value = 0.55
     scene.world = world
 
-    try:
-        scene.render.engine = "BLENDER_EEVEE_NEXT"
-    except Exception:
-        try:
-            scene.render.engine = "BLENDER_EEVEE"
-        except Exception:
-            pass
-    scene.render.resolution_x = PREVIEW_WIDTH
-    scene.render.resolution_y = PREVIEW_HEIGHT
+    used_engine = _apply_render_engine(bpy, scene, engine_name, sample_count)
+    color_management = _configure_color_management(bpy, scene)
+    scene.render.resolution_x = render_width
+    scene.render.resolution_y = render_height
     scene.render.resolution_percentage = 100
     scene.render.image_settings.file_format = "PNG"
     scene.render.image_settings.color_mode = "RGBA"
@@ -983,16 +1070,33 @@ def render_preview_view(bpy: Any, output_path: str, view: str) -> dict[str, Any]
         raise RuntimeError("Preview render completed without producing PNG")
 
     return {
-        "width": PREVIEW_WIDTH,
-        "height": PREVIEW_HEIGHT,
+        "width": render_width,
+        "height": render_height,
         "view": view,
+        "engine": used_engine,
+        "samples": sample_count,
+        **color_management,
     }
 
 
-def render_main_preview(bpy: Any, observation: dict[str, Any], output_path: str) -> dict[str, Any]:
+def render_main_preview(
+    bpy: Any,
+    observation: dict[str, Any],
+    output_path: str,
+    preview_options: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Render the standard deterministic three-quarter MAIN image in worker memory."""
     _ = observation
-    return render_preview_view(bpy, output_path, "THREE_QUARTER")
+    options = preview_options or {}
+    return render_preview_view(
+        bpy,
+        output_path,
+        "THREE_QUARTER",
+        width=options.get("width"),
+        height=options.get("height"),
+        engine=options.get("engine"),
+        samples=options.get("samples"),
+    )
 
 
 def _remove_preview_rig(bpy: Any) -> None:
@@ -1192,6 +1296,9 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
     preview_path = str(job.get("previewPath") or "")
     payload_path = str(job.get("payloadPath") or "")
     result_path = str(job.get("resultPath") or "")
+    preview_options = job.get("previewOptions") or {}
+    if not isinstance(preview_options, dict):
+        raise ValueError("job.previewOptions must be an object")
 
     if not prepare_id:
         raise ValueError("job.prepareId is required")
@@ -1213,9 +1320,11 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
         bpy.ops.wm.open_mainfile(filepath=source_path)
         open_ms = _elapsed_ms(open_started)
 
-        publish_objects: list[Any] | None = None
-        if profile == "PUBLISH":
-            publish_objects = normalize_publish_context(bpy)
+        # Every profile renders the same isolated asset closure. A CURRENT_SELECTION
+        # snapshot carries objects that are not linked into any collection, so
+        # without this the preview renders an empty frame and the evidence reports
+        # millimetre coordinates as metres.
+        closure_objects = normalize_publish_context(bpy)
 
         inspect_started = time.perf_counter()
         observation = extract_observation(
@@ -1225,7 +1334,7 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
             source_path=source_path,
             source_display_name=source_display_name,
             profile=profile,
-            objects=publish_objects,
+            objects=closure_objects,
             observation_scope="PUBLISH_PAYLOAD" if profile == "PUBLISH" else "SOURCE_ASSET",
         )
         inspect_ms = _elapsed_ms(inspect_started)
@@ -1238,7 +1347,7 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
             pack_ms = _elapsed_ms(pack_started)
 
         preview_started = time.perf_counter()
-        preview_evidence = render_main_preview(bpy, observation, preview_path)
+        preview_evidence = render_main_preview(bpy, observation, preview_path, preview_options)
         preview_ms = _elapsed_ms(preview_started)
         observation["previewEvidence"] = {
             "presetVersion": PREVIEW_PRESET_VERSION,
@@ -1257,6 +1366,7 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
             "profile": profile,
             "observation": observation,
             "previewPath": preview_path,
+            "previewOptions": preview_options,
         }
 
         if profile == "PUBLISH":
