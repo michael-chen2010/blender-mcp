@@ -15,13 +15,18 @@ PNG_BYTES = b"\x89PNG\r\n\x1a\nprepared-main-preview"
 
 
 class _FakeArtifactStore:
-    def __init__(self, preview_path: Path):
+    def __init__(self, preview_path: Path, viewer_path: Path | None = None):
         self.preview_path = preview_path
+        self.viewer_path = viewer_path or preview_path.with_name("viewer.glb")
+        if not self.viewer_path.exists():
+            self.viewer_path.write_bytes(b"glTF")
 
     def resolve(self, artifact_id: str) -> Path:
-        if artifact_id != "preview-opaque":
-            raise AssertionError(f"unexpected artifact id: {artifact_id}")
-        return self.preview_path
+        if artifact_id == "preview-opaque":
+            return self.preview_path
+        if artifact_id == "viewer-opaque":
+            return self.viewer_path
+        raise AssertionError(f"unexpected artifact id: {artifact_id}")
 
 
 def _ready_result(tmp_path: Path, *, source_kind: str = "BLEND_FILE") -> tuple[dict, Path]:
@@ -69,6 +74,14 @@ def _ready_result(tmp_path: Path, *, source_kind: str = "BLEND_FILE") -> tuple[d
                 "factsVerifiedAfterReopen": True,
             },
             "previewPath": str(preview_path),
+            "viewerPath": str(tmp_path / "viewer.glb"),
+            "viewer": {"status": "OK", "size": 3},
+            "viewerEvidence": {
+                "format": "GLB",
+                "size": 3,
+                "sha256": "b" * 64,
+                "derivedFromPayloadSha256": "a" * 64,
+            },
             "artifacts": [
                 {
                     "artifact_id": "preview-opaque",
@@ -77,7 +90,15 @@ def _ready_result(tmp_path: Path, *, source_kind: str = "BLEND_FILE") -> tuple[d
                     "sha256": digest,
                     "content_type": "image/png",
                     "expires_at": "2026-09-15T12:00:00.000Z",
-                }
+                },
+                {
+                    "artifact_id": "viewer-opaque",
+                    "kind": "VIEWER",
+                    "size": 3,
+                    "sha256": "b" * 64,
+                    "content_type": "model/gltf-binary",
+                    "expires_at": "2026-09-15T12:00:00.000Z",
+                },
             ],
             "warnings": [],
             "timings": {"openMs": 1.0, "inspectMs": 2.0, "previewMs": 3.0, "totalMs": 6.0},
@@ -200,7 +221,16 @@ def test_mcp_result_contains_structured_data_text_summary_and_main_image(monkeyp
             "sha256": hashlib.sha256(PNG_BYTES).hexdigest(),
             "mimeType": "image/png",
             "expiresAt": "2026-09-15T12:00:00.000Z",
-        }
+        },
+        {
+            "artifactId": "viewer-opaque",
+            "kind": "VIEWER",
+            "fileName": "viewer.glb",
+            "size": 3,
+            "sha256": "b" * 64,
+            "mimeType": "model/gltf-binary",
+            "expiresAt": "2026-09-15T12:00:00.000Z",
+        },
     ]
     serialized = json.dumps(structured, ensure_ascii=False)
     assert str(preview_path) not in serialized
@@ -214,6 +244,7 @@ def test_mcp_result_contains_structured_data_text_summary_and_main_image(monkeyp
     assert "METADATA" in summary_text
     # Text-only clients cannot see structuredContent, so the handle must be in text.
     assert "artifactId=preview-opaque" in summary_text
+    assert "VIEWER artifactId=viewer-opaque" in summary_text
     assert structured["artifacts"][0]["sha256"] in summary_text
     # Text-only clients must also receive the facts they need to build a Draft.
     assert "\nFACTS " in summary_text
@@ -510,6 +541,7 @@ def test_text_projection_carries_publish_facts_without_local_file_access(monkeyp
     assert facts["materialWorkflow"] == "PBR"
     assert facts["dimensionsMeters"] == {"x": 1.5, "y": 2.5, "z": 0.75}
     assert facts["hasUv"] is True
+    assert facts["viewerEvidence"]["derivedFromPayloadSha256"] == "a" * 64
 
     validation = json.loads(text.split("\nVALIDATION ", 1)[1].split("\nFACTS/VALIDATION", 1)[0])
     assert validation["status"] == "PASSED"
@@ -530,7 +562,8 @@ def test_batch_window_text_projection_exposes_facts_and_artifact_handles():
     label = server._prepared_item_text_label("item-a", "a.blend", structured)
     text = label.text
 
-    assert text.startswith("item-a — a.blend")
+    assert text.splitlines()[0].startswith("item-a ")
+    assert text.splitlines()[0].endswith("a.blend")
     assert "\nFACTS " in text
     assert "\nVALIDATION " in text
     assert "PAYLOAD artifactId=payload-1" in text

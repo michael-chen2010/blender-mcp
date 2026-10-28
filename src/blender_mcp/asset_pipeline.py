@@ -172,6 +172,19 @@ def _register_result_artifacts(
                 content_type="application/x-blender",
             ),
         )
+        # The derived GLB is the only artefact the web viewer can render. It must be
+        # published as its own VIEWER object, otherwise the asset has no 3D preview.
+        viewer_path = Path(str(result.get("viewerPath") or ""))
+        viewer_status = str((result.get("viewer") or {}).get("status") or "")
+        if viewer_status == "OK" and viewer_path.is_file():
+            refs.append(
+                store.register_artifact(
+                    prepare_id,
+                    "VIEWER",
+                    viewer_path,
+                    content_type="model/gltf-binary",
+                )
+            )
     result["artifacts"] = [asdict(ref) for ref in refs]
 
 

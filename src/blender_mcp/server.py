@@ -752,7 +752,7 @@ def _prepare_blend_asset_content(result: Dict[str, Any], profile: str) -> CallTo
         "\nUpload with upload_prepared_artifact(artifact_id, method, signed_url,"
         " expected_size, expected_sha256); handles are short-lived."
     )
-    facts = _compact_prepared_observation(observation)
+    facts = _compact_prepared_observation(_facts_source(observation, result))
     if facts:
         summary += "\nFACTS " + _compact_json_text(facts)
     validation_facts = _prepare_validation_facts(result.get("validation"))
@@ -865,6 +865,7 @@ def _compact_prepared_observation(observation: Any) -> Dict[str, Any]:
     evidence = observation.get("evidenceSummary") if isinstance(observation.get("evidenceSummary"), dict) else {}
     preview_evidence = observation.get("previewEvidence") if isinstance(observation.get("previewEvidence"), dict) else {}
     payload_evidence = observation.get("payloadEvidence") if isinstance(observation.get("payloadEvidence"), dict) else {}
+    viewer_evidence = observation.get("viewerEvidence") if isinstance(observation.get("viewerEvidence"), dict) else {}
 
     compact: Dict[str, Any] = {}
     if observation.get("observationScope") is not None:
@@ -937,6 +938,14 @@ def _compact_prepared_observation(observation: Any) -> Dict[str, Any]:
     }
     if compact_payload_evidence:
         compact["payloadEvidence"] = compact_payload_evidence
+
+    compact_viewer_evidence = {
+        key: viewer_evidence[key]
+        for key in ("format", "size", "sha256", "derivedFromPayloadSha256")
+        if key in viewer_evidence
+    }
+    if compact_viewer_evidence:
+        compact["viewerEvidence"] = compact_viewer_evidence
     return compact
 
 
@@ -989,7 +998,7 @@ def _prepared_artifact_text_lines(prepared_artifacts: Any) -> List[str]:
     if not isinstance(prepared_artifacts, dict):
         return []
     lines: List[str] = []
-    for role, label in (("payload", "PAYLOAD"), ("mainPreview", "PREVIEW")):
+    for role, label in (("payload", "PAYLOAD"), ("mainPreview", "PREVIEW"), ("viewer", "VIEWER")):
         ref = prepared_artifacts.get(role)
         if not isinstance(ref, dict) or not ref.get("artifactId"):
             continue
@@ -1015,6 +1024,16 @@ def _prepared_item_text_label(
         lines.append("VALIDATION " + _compact_json_text(validation))
     lines.extend(_prepared_artifact_text_lines(structured.get("preparedArtifacts")))
     return TextContent(type="text", text="\n".join(lines))
+
+
+def _facts_source(observation: Any, result: Dict[str, Any]) -> Any:
+    """Merge result-level viewer evidence into the observation used for FACTS."""
+    if not isinstance(observation, dict):
+        return observation
+    viewer_evidence = result.get("viewerEvidence")
+    if isinstance(viewer_evidence, dict) and "viewerEvidence" not in observation:
+        return {**observation, "viewerEvidence": viewer_evidence}
+    return observation
 
 
 def _public_prepared_artifact(raw: Any) -> Dict[str, Any] | None:
@@ -1058,6 +1077,7 @@ def _prepared_window_item_content(raw_item: Dict[str, Any]) -> tuple[Dict[str, A
         store = get_prepared_artifact_store()
         preview_identity: Dict[str, Any] | None = None
         payload_identity: Dict[str, Any] | None = None
+        viewer_identity: Dict[str, Any] | None = None
         preview_path: Path | None = None
         with store.lease(prepare_id):
             for raw_artifact in result.get("artifacts", []):
@@ -1069,6 +1089,8 @@ def _prepared_window_item_content(raw_item: Dict[str, Any]) -> tuple[Dict[str, A
                     preview_path = store.resolve(public_artifact["artifactId"])
                 elif public_artifact["kind"] == "PAYLOAD" and payload_identity is None:
                     payload_identity = public_artifact
+                elif public_artifact["kind"] == "VIEWER" and viewer_identity is None:
+                    viewer_identity = public_artifact
 
             if preview_identity is None or preview_path is None:
                 raise PreparedArtifactError(
@@ -1091,6 +1113,8 @@ def _prepared_window_item_content(raw_item: Dict[str, Any]) -> tuple[Dict[str, A
         prepared_artifacts: Dict[str, Any] = {"mainPreview": preview_identity}
         if payload_identity is not None:
             prepared_artifacts["payload"] = payload_identity
+        if viewer_identity is not None:
+            prepared_artifacts["viewer"] = viewer_identity
 
         structured = {
             "itemKey": item_key,
@@ -1098,7 +1122,7 @@ def _prepared_window_item_content(raw_item: Dict[str, Any]) -> tuple[Dict[str, A
             "sourceDisplayName": source_display_name,
             "status": "READY",
             "evidenceIdentity": evidence_identity,
-            "compactObservation": _compact_prepared_observation(observation),
+            "compactObservation": _compact_prepared_observation(_facts_source(observation, result)),
             "preparedArtifacts": prepared_artifacts,
             "validation": result.get("validation") if isinstance(result.get("validation"), dict) else {},
             "timings": {

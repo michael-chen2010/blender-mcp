@@ -13,7 +13,7 @@ import threading
 import time
 from typing import Callable, Iterator, Literal
 
-ArtifactKind = Literal["PAYLOAD", "PREVIEW"]
+ArtifactKind = Literal["PAYLOAD", "PREVIEW", "VIEWER"]
 RetainedSourceKind = Literal["PAYLOAD", "SOURCE_SNAPSHOT"]
 _DEFAULT_TTL_SECONDS = 60 * 60
 
@@ -176,8 +176,8 @@ class PreparedArtifactStore:
         *,
         content_type: str,
     ) -> PreparedArtifactRef:
-        if kind not in {"PAYLOAD", "PREVIEW"}:
-            raise ValueError("kind must be PAYLOAD or PREVIEW")
+        if kind not in {"PAYLOAD", "PREVIEW", "VIEWER"}:
+            raise ValueError("kind must be PAYLOAD, PREVIEW or VIEWER")
         with self._lock:
             workspace = self._workspaces.get(prepare_id)
             if workspace is None:
