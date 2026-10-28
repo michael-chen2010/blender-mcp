@@ -21,3 +21,7 @@ local_tests/
 supabase/
 
 scripts/
+
+# Local deployment credentials
+/deployment/windows/asset-mcp.local.psd1
+/deployment/windows/blender-mcp.local.psd1
