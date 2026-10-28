@@ -752,6 +752,18 @@ def _prepare_blend_asset_content(result: Dict[str, Any], profile: str) -> CallTo
         "\nUpload with upload_prepared_artifact(artifact_id, method, signed_url,"
         " expected_size, expected_sha256); handles are short-lived."
     )
+    facts = _compact_prepared_observation(observation)
+    if facts:
+        summary += "\nFACTS " + _compact_json_text(facts)
+    validation_facts = _prepare_validation_facts(result.get("validation"))
+    if validation_facts:
+        summary += "\nVALIDATION " + _compact_json_text(validation_facts)
+    summary += (
+        "\nFACTS/VALIDATION are the authoritative technical evidence for the draft"
+        " technical_metadata and client validation report; no filesystem access is"
+        " required to read them. Use inspect_prepared_asset only for deeper"
+        " per-section detail."
+    )
     return CallToolResult(
         content=[
             TextContent(type="text", text=summary),
@@ -866,11 +878,14 @@ def _compact_prepared_observation(observation: Any) -> Dict[str, Any]:
         compact["source"] = compact_source
     scalar_fields = (
         ("objectCount", structure.get("objectCount")),
+        ("collectionCount", structure.get("collectionCount")),
+        ("meshCount", geometry.get("meshCount")),
         ("vertexCount", geometry.get("vertexCount")),
         ("triangleCount", geometry.get("triangleCount")),
         ("hasUv", geometry.get("hasUv")),
         ("lodCount", geometry.get("lodCount")),
         ("materialCount", materials.get("materialCount")),
+        ("textureCount", materials.get("textureCount")),
         ("materialWorkflow", materials.get("materialWorkflow")),
         ("rigged", deformation.get("rigged")),
         ("animated", deformation.get("animated")),
@@ -923,6 +938,83 @@ def _compact_prepared_observation(observation: Any) -> Dict[str, Any]:
     if compact_payload_evidence:
         compact["payloadEvidence"] = compact_payload_evidence
     return compact
+
+
+# Text-only MCP clients project `content` (TextContent/ImageContent) but not
+# `structuredContent`; a host may also run on a different machine with no
+# filesystem access to the Blender/MCP host (deployed servers, sandboxed
+# agents). Every fact an Agent must read back — technical facts, validation,
+# artifact handles — therefore has to appear in the text channel too. The
+# projection is compact, deterministic and bounded so it cannot flood context.
+_PREPARED_FACTS_TEXT_MAX_CHARS = 12000
+
+
+def _compact_json_text(value: Any, *, max_chars: int = _PREPARED_FACTS_TEXT_MAX_CHARS) -> str:
+    try:
+        text = json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+            default=str,
+        )
+    except (TypeError, ValueError):
+        return '{"_unserializable":true}'
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "…(truncated)"
+
+
+def _prepare_validation_facts(validation: Any) -> Dict[str, Any]:
+    """Project the validation report fields an Agent must echo into a Draft."""
+    if not isinstance(validation, dict):
+        return {}
+    return {
+        key: validation[key]
+        for key in (
+            "status",
+            "entryType",
+            "entryName",
+            "selfContained",
+            "factsVerifiedAfterReopen",
+            "dimensionToleranceMeters",
+            "verifiedFields",
+        )
+        if key in validation
+    }
+
+
+def _prepared_artifact_text_lines(prepared_artifacts: Any) -> List[str]:
+    """Render upload handles so text-only clients can call the transfer tools."""
+    if not isinstance(prepared_artifacts, dict):
+        return []
+    lines: List[str] = []
+    for role, label in (("payload", "PAYLOAD"), ("mainPreview", "PREVIEW")):
+        ref = prepared_artifacts.get(role)
+        if not isinstance(ref, dict) or not ref.get("artifactId"):
+            continue
+        lines.append(
+            f"{label} artifactId={ref.get('artifactId')} size={ref.get('size')}"
+            f" sha256={ref.get('sha256')}"
+        )
+    return lines
+
+
+def _prepared_item_text_label(
+    item_key: str,
+    source_display_name: str,
+    structured: Dict[str, Any],
+) -> TextContent:
+    """Text projection of one READY item: facts, validation and upload handles."""
+    lines = [f"{item_key} — {source_display_name}"]
+    facts = structured.get("compactObservation")
+    if isinstance(facts, dict) and facts:
+        lines.append("FACTS " + _compact_json_text(facts))
+    validation = _prepare_validation_facts(structured.get("validation"))
+    if validation:
+        lines.append("VALIDATION " + _compact_json_text(validation))
+    lines.extend(_prepared_artifact_text_lines(structured.get("preparedArtifacts")))
+    return TextContent(type="text", text="\n".join(lines))
 
 
 def _public_prepared_artifact(raw: Any) -> Dict[str, Any] | None:
@@ -1013,7 +1105,7 @@ def _prepared_window_item_content(raw_item: Dict[str, Any]) -> tuple[Dict[str, A
                 "cacheReadMs": round((time.perf_counter() - started) * 1000.0, 3),
             },
         }
-        label = TextContent(type="text", text=f"{item_key} — {source_display_name}")
+        label = _prepared_item_text_label(item_key, source_display_name, structured)
         return structured, label, image_content
     except PreparedArtifactError as exc:
         structured = {
@@ -1141,8 +1233,19 @@ def _batch_prepare_page_content(page: Dict[str, Any]) -> CallToolResult:
             public_item["result"] = public_result
         public_page["items"].append(public_item)
         if public_item.get("status") == "READY" and preview_path is not None:
-            label = f"{public_item.get('itemKey')} — {public_item.get('sourceDisplayName')}"
-            content.append(TextContent(type="text", text=label))
+            # Handles for this legacy path are emitted below, after the image.
+            content.append(
+                _prepared_item_text_label(
+                    str(public_item.get("itemKey") or ""),
+                    str(public_item.get("sourceDisplayName") or ""),
+                    {
+                        "compactObservation": _compact_prepared_observation(
+                            public_item.get("result", {}).get("observation")
+                        ),
+                        "validation": public_item.get("result", {}).get("validation"),
+                    },
+                )
+            )
             content.append(Image(path=preview_path, format="png").to_image_content())
             # Text-only clients project `content` but not `structuredContent`, so
             # batch uploads need the handles spelled out here as well.
@@ -1387,6 +1490,9 @@ def inspect_prepared_asset(
             + (f" of {total_count}" if isinstance(total_count, int) else "")
             + " cached detail item(s)."
         )
+        # Text-only clients cannot read structuredContent; project the page so
+        # section facts (dimensions, per-object stats, materials) stay readable.
+        summary += "\nFACTS " + _compact_json_text(result)
         return CallToolResult(
             content=[TextContent(type="text", text=summary)],
             structuredContent=result,

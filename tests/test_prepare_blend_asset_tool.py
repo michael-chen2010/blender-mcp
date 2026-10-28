@@ -42,7 +42,31 @@ def _ready_result(tmp_path: Path, *, source_kind: str = "BLEND_FILE") -> tuple[d
                     "displayName": "asset.blend",
                     "blenderVersion": "5.2.0",
                 },
-                "structure": {"objectCount": 2},
+                "structure": {"objectCount": 2, "collectionCount": 1},
+                "geometry": {
+                    "triangleCount": 1234,
+                    "vertexCount": 700,
+                    "hasUv": True,
+                    "lodCount": 0,
+                    "dimensionsMeters": {"x": 1.5, "y": 2.5, "z": 0.75},
+                },
+                "materials": {
+                    "materialCount": 3,
+                    "materialWorkflow": "PBR",
+                    "pbrChannels": ["base_color", "roughness"],
+                },
+                "deformation": {"rigged": False, "animated": False},
+                "evidenceSummary": {
+                    "objectNames": ["A", "B"],
+                    "materialNames": ["M1", "M2"],
+                },
+            },
+            "validation": {
+                "status": "PASSED",
+                "entryType": "COLLECTION",
+                "entryName": "ASSET_ROOT",
+                "selfContained": True,
+                "factsVerifiedAfterReopen": True,
             },
             "previewPath": str(preview_path),
             "artifacts": [
@@ -191,7 +215,11 @@ def test_mcp_result_contains_structured_data_text_summary_and_main_image(monkeyp
     # Text-only clients cannot see structuredContent, so the handle must be in text.
     assert "artifactId=preview-opaque" in summary_text
     assert structured["artifacts"][0]["sha256"] in summary_text
-    assert len(summary_text) < 800
+    # Text-only clients must also receive the facts they need to build a Draft.
+    assert "\nFACTS " in summary_text
+    assert "\nVALIDATION " in summary_text
+    assert len(summary_text) < 4000
+    assert str(preview_path) not in summary_text
     assert isinstance(result.content[1], ImageContent)
     assert result.content[1].mimeType == "image/png"
     assert base64.b64decode(result.content[1].data) == PNG_BYTES
@@ -453,3 +481,57 @@ def test_supplemental_renderer_uses_local_addon_runtime_resolution(monkeypatch, 
         }
     ]
     assert render_runtimes == [runtime]
+
+
+def test_text_projection_carries_publish_facts_without_local_file_access(monkeypatch, tmp_path: Path):
+    """A host with no filesystem access to the MCP machine must still get facts."""
+
+    source = tmp_path / "asset.blend"
+    source.write_bytes(b"BLENDER-source")
+    ready, preview_path = _ready_result(tmp_path)
+
+    monkeypatch.setattr(server, "prepare_blend_file", lambda *_args, **_kwargs: ready, raising=False)
+    monkeypatch.setattr(
+        server,
+        "get_prepared_artifact_store",
+        lambda: _FakeArtifactStore(preview_path),
+        raising=False,
+    )
+
+    result = _call_tool(
+        {"source": {"kind": "BLEND_FILE", "path": str(source)}, "profile": "PUBLISH"}
+    )
+
+    text = result.content[0].text
+    facts = json.loads(text.split("\nFACTS ", 1)[1].split("\nVALIDATION ", 1)[0])
+    assert facts["objectCount"] == 2
+    assert facts["triangleCount"] == 1234
+    assert facts["materialCount"] == 3
+    assert facts["materialWorkflow"] == "PBR"
+    assert facts["dimensionsMeters"] == {"x": 1.5, "y": 2.5, "z": 0.75}
+    assert facts["hasUv"] is True
+
+    validation = json.loads(text.split("\nVALIDATION ", 1)[1].split("\nFACTS/VALIDATION", 1)[0])
+    assert validation["status"] == "PASSED"
+    assert validation["entryName"] == "ASSET_ROOT"
+    assert validation["selfContained"] is True
+
+
+def test_batch_window_text_projection_exposes_facts_and_artifact_handles():
+    structured = {
+        "compactObservation": {"objectCount": 1, "triangleCount": 10},
+        "validation": {"status": "PASSED", "selfContained": True},
+        "preparedArtifacts": {
+            "payload": {"artifactId": "payload-1", "size": 99, "sha256": "abc"},
+            "mainPreview": {"artifactId": "preview-1", "size": 9, "sha256": "def"},
+        },
+    }
+
+    label = server._prepared_item_text_label("item-a", "a.blend", structured)
+    text = label.text
+
+    assert text.startswith("item-a — a.blend")
+    assert "\nFACTS " in text
+    assert "\nVALIDATION " in text
+    assert "PAYLOAD artifactId=payload-1" in text
+    assert "PREVIEW artifactId=preview-1" in text

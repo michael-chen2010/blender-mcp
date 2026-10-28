@@ -518,9 +518,11 @@ def test_batch_mcp_get_returns_item_labels_and_adjacent_images(monkeypatch, tmp_
     # content = [batch header, (label, MAIN image, handle line) per READY item]
     kinds = [type(block) for block in result.content]
     assert kinds == [TextContent, TextContent, ImageContent, TextContent, TextContent, ImageContent, TextContent]
-    assert result.content[1].text == "item-a — a.blend"
+    assert result.content[1].text.splitlines()[0] == "item-a — a.blend"
+    assert "\nFACTS " in result.content[1].text
     assert "artifactId=preview-a" in result.content[3].text
-    assert result.content[4].text == "item-b — b.blend"
+    assert result.content[4].text.splitlines()[0] == "item-b — b.blend"
+    assert "\nFACTS " in result.content[4].text
     assert "artifactId=preview-b" in result.content[6].text
 
 

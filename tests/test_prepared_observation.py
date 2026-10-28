@@ -340,6 +340,11 @@ def test_inspect_mcp_tool_returns_cached_structured_content_without_gui_or_worke
     assert isinstance(result.content[0], TextContent)
     assert "item-a" in result.content[0].text
     assert "STRUCTURE" in result.content[0].text
+    # Text-only clients cannot see structuredContent; the page must be in text.
+    facts = json.loads(result.content[0].text.split("\nFACTS ", 1)[1])
+    assert facts["boundedDetails"]["items"][0]["name"] == "A"
+    assert facts["boundedDetails"]["totalCount"] == 4
+    assert facts["nextCursor"] == "2"
 
 
 def test_render_mcp_tool_returns_matching_item_label_and_image(monkeypatch, tmp_path: Path):
