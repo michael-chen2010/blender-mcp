@@ -10,8 +10,14 @@ $ErrorActionPreference = "Stop"
 
 $ConfigPath = [System.IO.Path]::GetFullPath($ConfigPath)
 $exampleConfigPath = Join-Path $PSScriptRoot "blender-mcp.local.example.psd1"
-$wheelPath = Join-Path $PSScriptRoot "blender_mcp-1.9.1-py3-none-any.whl"
 $profileName = "blender-mcp"
+
+$wheelCandidates = @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter "blender_mcp-*-py3-none-any.whl" -File)
+if ($wheelCandidates.Count -ne 1) {
+    throw "Expected exactly one blender_mcp-*-py3-none-any.whl beside the deployment scripts; found $($wheelCandidates.Count). Run build-release.ps1 or remove obsolete wheel files."
+}
+$wheelPath = [System.IO.Path]::GetFullPath($wheelCandidates[0].FullName)
+$wheelName = $wheelCandidates[0].Name
 
 if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
     if (-not (Test-Path -LiteralPath $exampleConfigPath -PathType Leaf)) {
@@ -32,9 +38,6 @@ if ($tunnelId -notmatch '^tunnel_(?:[a-z0-9]{32}|[a-z0-9]{4}_[a-z0-9]{32})$') {
     throw "TunnelId in '$ConfigPath' is invalid. Use the tunnel ID copied from the OpenAI Tunnels settings."
 }
 
-if (-not (Test-Path -LiteralPath $wheelPath -PathType Leaf)) {
-    throw "Packaged wheel not found: '$wheelPath'. Copy blender_mcp-1.9.1-py3-none-any.whl beside the deployment scripts."
-}
 $uvx = Get-Command uvx -ErrorAction SilentlyContinue
 if (-not $uvx -or -not $uvx.Source) {
     throw "uvx was not found on PATH. Install uv first, then open a new PowerShell window."
@@ -48,9 +51,9 @@ if (-not $SkipAddonInstall) {
     & (Join-Path $PSScriptRoot "install-addon.ps1") -WheelPath $wheelPath
 }
 
-# start.ps1 changes its working directory to this folder before launching tunnel-client,
-# so the relative wheel path below resolves even when the deployment folder is moved.
-$mcpCommand = 'uvx --from blender_mcp-1.9.1-py3-none-any.whl blender-mcp'
+# Reinstall the selected local wheel when tunnel-client starts the MCP stdio process.
+# start.ps1 sets the child process working directory to this deployment folder.
+$mcpCommand = "uvx --reinstall-package blender-mcp --from $wheelName blender-mcp"
 Write-Host "Initializing tunnel-client profile '$profileName' with sample_mcp_stdio_local..."
 Write-Host "Tunnel ID: configured (value hidden)"
 Write-Host "MCP command: $mcpCommand"
