@@ -730,11 +730,17 @@ class AssetPipelineManager:
             path = Path(path_value).expanduser().resolve()
             if path.suffix.lower() != ".blend":
                 raise AssetBatchError("BATCH_PREPARE_INVALID_SOURCE", "Batch source must end with .blend")
+            source_display_name = raw.get("sourceDisplayName", path.name)
+            if not isinstance(source_display_name, str) or not source_display_name.strip():
+                raise AssetBatchError(
+                    "BATCH_PREPARE_SOURCE_DISPLAY_NAME_INVALID",
+                    "sourceDisplayName must be a non-empty string when supplied",
+                )
             normalized.append(
                 {
                     "itemKey": item_key,
                     "path": path,
-                    "sourceDisplayName": path.name,
+                    "sourceDisplayName": source_display_name.strip(),
                     "sourceFingerprint": self._normalize_fingerprint(raw.get("sourceFingerprint")),
                 }
             )
@@ -751,6 +757,7 @@ class AssetPipelineManager:
                 {
                     "itemKey": item["itemKey"],
                     "path": str(item["path"]),
+                    "sourceDisplayName": item["sourceDisplayName"],
                     "sourceFingerprint": item["sourceFingerprint"],
                 }
                 for item in items

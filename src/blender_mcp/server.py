@@ -9,13 +9,17 @@ import tempfile
 import threading
 from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Dict, Any, List
+from typing import Annotated, AsyncIterator, Dict, Any, List, Literal, Mapping
+import hashlib
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
 import base64
 from urllib.parse import urlparse
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # Import telemetry
 from .telemetry import record_startup, get_telemetry, EventType
@@ -59,6 +63,179 @@ logger = logging.getLogger("BlenderMCPServer")
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 9876
 
+
+class _StrictToolModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True, str_strip_whitespace=True)
+
+
+PrepareBlendSource = Annotated[
+    Dict[str, Any],
+    Field(
+        description="Discriminated source: BLEND_FILE requires path; CURRENT_SELECTION snapshots the entire current selection as one logical asset and forbids path.",
+        json_schema_extra={
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"type": "string", "const": "BLEND_FILE"},
+                        "path": {"type": "string", "minLength": 1},
+                    },
+                    "required": ["kind", "path"],
+                    "additionalProperties": False,
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"type": "string", "const": "CURRENT_SELECTION"},
+                    },
+                    "required": ["kind"],
+                    "additionalProperties": False,
+                },
+            ]
+        },
+    ),
+]
+
+
+PrepareOverrides = Annotated[
+    Dict[str, Any],
+    Field(
+        description="Optional MAIN preview settings. Unknown keys are rejected; values are validated by the tool and returned with stable PREPARE_INVALID_OVERRIDES errors.",
+        json_schema_extra={
+            "type": "object",
+            "properties": {
+                "preview": {
+                    "type": "object",
+                    "properties": {
+                        "width": {"type": "integer", "minimum": 1, "maximum": 4096},
+                        "height": {"type": "integer", "minimum": 1, "maximum": 4096},
+                        "views": {
+                            "type": "array",
+                            "items": {"type": "string", "const": "MAIN"},
+                            "minItems": 1,
+                            "maxItems": 1,
+                        },
+                        "engine": {"type": "string", "enum": ["EEVEE", "CYCLES", "eevee", "cycles"]},
+                        "samples": {"type": "integer", "minimum": 1, "maximum": 2048},
+                    },
+                    "additionalProperties": False,
+                }
+            },
+            "additionalProperties": False,
+        },
+    ),
+]
+
+
+class BlendFileBatchItem(_StrictToolModel):
+    item_key: str = Field(alias="itemKey", min_length=1, max_length=128, description="Stable item identity within this file batch.")
+    path: str = Field(min_length=1, description="Path to one independent on-disk .blend file.")
+    source_fingerprint: str = Field(
+        alias="sourceFingerprint",
+        pattern=r"^[0-9a-fA-F]{64}$",
+        description="SHA-256 of the exact .blend file bytes at discovery time.",
+    )
+
+
+class SceneAssetBatchItem(_StrictToolModel):
+    asset_key: str = Field(
+        min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+        description="Stable unique asset key for one logical asset in this scene batch.",
+    )
+    root_object_ids: list[Annotated[str, Field(min_length=28, max_length=28, pattern=r"^obj_[0-9a-f]{24}$")]] = Field(
+        min_length=1, max_length=64,
+        json_schema_extra={"uniqueItems": True},
+        description="One or more rootObjectId values from the same discover_scene_asset_roots result. Multiple roots may form one logical asset.",
+    )
+    display_name: str | None = Field(
+        default=None, min_length=1, max_length=128,
+        description="Optional human-readable name for this logical asset; does not affect object grouping.",
+    )
+    dependency_policy: Literal["ASSET_CLOSURE"] = Field(
+        default="ASSET_CLOSURE",
+        description="Include hierarchy descendants and required object dependencies in this asset snapshot.",
+    )
+
+    @field_validator("root_object_ids")
+    @classmethod
+    def _unique_root_object_ids(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value):
+            raise ValueError("root_object_ids must not contain duplicates")
+        return value
+
+
+class PreparedAssetWindowItem(_StrictToolModel):
+    item_key: str = Field(min_length=1, max_length=128, description="Stable itemKey returned by get_prepare_blend_assets for this exact batch item.")
+    prepare_id: str = Field(min_length=1, max_length=128, description="Prepared asset ID returned for this exact item; do not pair it with another itemKey.")
+
+
+class PreparedArtifactUploadItem(_StrictToolModel):
+    item_key: str = Field(alias="itemKey", min_length=1, max_length=128, description="Stable batch item key that owns this artifact; it may repeat for different artifacts of the same item.")
+    artifact_id: str = Field(alias="artifactId", min_length=1, max_length=256, description="Exact prepared artifact handle returned by Blender MCP; do not use a local file path.")
+    method: Literal["PUT"] = Field(description="Upload method from the AssetPlatform grant; only PUT is supported.")
+    url: str = Field(min_length=9, pattern=r"^https?://", json_schema_extra={"format": "uri"}, description="Short-lived absolute HTTP(S) upload URL from the AssetPlatform Upload Grant.")
+    headers: dict[str, str] = Field(default_factory=dict, description="Required upload headers supplied with the same signed URL; do not invent or omit grant headers.")
+    expected_size: int | None = Field(default=None, alias="expectedSize", ge=0, description="Expected artifact byte count from the grant, when supplied.")
+    expected_sha256: str | None = Field(
+        default=None, alias="expectedSha256", min_length=64, max_length=64, pattern=r"^[0-9a-fA-F]{64}$", description="Expected artifact SHA-256 from the grant, when supplied."
+    )
+
+
+class SceneAssetToolError(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    code: str = Field(min_length=1, max_length=96, description="Stable machine-readable error code; use it to select recovery behavior.")
+    message: str = Field(min_length=1, max_length=2048, description="Human-readable explanation of the failure and the next safe action.")
+
+
+class SceneAssetRoot(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    root_object_id: str = Field(min_length=28, max_length=28, pattern=r"^obj_[0-9a-f]{24}$", description="Opaque root identity scoped to this exact scene_fingerprint; never construct or reuse it after rediscovery.")
+    object_name: str = Field(min_length=1, max_length=128, description="Blender object name to use only when requesting an explicit snapshot through the server.")
+    object_type: str = Field(min_length=1, max_length=64, description="Blender object type of this hierarchy root.")
+    data_name: str | None = Field(default=None, max_length=128)
+    collection_names: list[str] = Field(default_factory=list)
+    descendant_object_ids: list[Annotated[str, Field(min_length=28, max_length=28, pattern=r"^obj_[0-9a-f]{24}$")]] = Field(default_factory=list)
+    descendant_object_names: list[str] = Field(default_factory=list)
+    object_count: int = Field(ge=1)
+    geometry_object_count: int = Field(ge=0)
+
+
+class SceneAssetRootDiscoveryResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    ok: bool = Field(description="False means discovery failed; inspect error and do not start a scene batch.")
+    scene_fingerprint: str | None = Field(default=None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$", description="SHA-256 identity of the discovered scene state. Every root_object_id in roots is scoped to this value.")
+    scene_name: str | None = Field(default=None, min_length=1, max_length=128)
+    source_blend_path: str | None = Field(default=None, max_length=4096)
+    blender_version: str | None = Field(default=None, max_length=64)
+    scene_object_count: int = Field(default=0, ge=0)
+    roots: list[SceneAssetRoot] = Field(default_factory=list, description="Top-level hierarchy candidates. A root and its parented descendants form one candidate; group multiple independent root IDs only when they form one logical asset.")
+    error: SceneAssetToolError | None = None
+
+
+class SceneAssetBatchSourceItem(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    item_key: str = Field(alias="itemKey", min_length=1, max_length=64, description="Stable AssetPlatform batch item key; identical to the scene batch asset_key.")
+    source_display_name: str = Field(alias="sourceDisplayName", min_length=1, max_length=128, description="Human-readable source name; pass unchanged to create_asset_import_batch.")
+    source_fingerprint: str = Field(alias="sourceFingerprint", min_length=64, max_length=64, pattern=r"^[0-9a-fA-F]{64}$", description="SHA-256 of the immutable snapshot .blend bytes; pass unchanged to create_asset_import_batch.")
+    root_object_ids: list[Annotated[str, Field(min_length=28, max_length=28, pattern=r"^obj_[0-9a-f]{24}$")]] = Field(min_length=1, max_length=64)
+    root_object_names: list[Annotated[str, Field(min_length=1, max_length=128)]] = Field(min_length=1, max_length=64)
+
+
+class SceneAssetBatchStartResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    ok: bool
+    batch_prepare_id: str | None = Field(default=None, min_length=1, max_length=128, description="Local Blender MCP batch ID; distinct from AssetPlatform batchId.")
+    status: Literal["RUNNING", "READY", "PARTIAL", "FAILED", "CANCELLED", "ERROR"]
+    item_count: int = Field(default=0, ge=0)
+    concurrency: int | None = Field(default=None, ge=1, le=12)
+    items: list[SceneAssetBatchSourceItem] = Field(
+        default_factory=list,
+        max_length=64,
+        description="Source identity manifest for registering the matching AssetPlatform import batch. Pass itemKey/sourceDisplayName/sourceFingerprint unchanged; local snapshot paths are intentionally omitted.",
+    )
+    error: SceneAssetToolError | None = None
+
+
 _addon_handshake = None
 _addon_handshake_checked = False
 _addon_handshake_lock = threading.Lock()
@@ -68,6 +245,20 @@ _prepared_artifact_transfer_service: PreparedArtifactTransferService | None = No
 _prepared_artifact_transfer_service_lock = threading.Lock()
 _asset_pipeline_manager: AssetPipelineManager | None = None
 _asset_pipeline_manager_lock = threading.Lock()
+def _resolve_mcp_state_root() -> Path:
+    configured = os.environ.get("BLENDER_MCP_STATE_DIR")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "pyproject.toml").is_file() and (parent / "src").is_dir():
+            return parent / ".mcp"
+    return Path.home() / ".mcp" / "blender-mcp"
+
+
+_SCENE_BATCH_ROOT = _resolve_mcp_state_root() / "scene-asset-batches"
+_scene_batch_manifest_paths: dict[str, Path] = {}
+_scene_batch_manifest_lock = threading.RLock()
+_scene_batch_startup_cleanup_done = False
 
 @dataclass
 class BlenderConnection:
@@ -337,12 +528,37 @@ def get_blender_connection():
     return _blender_connection
 
 
+def _require_addon_capabilities(required: set[str]) -> None:
+    with _addon_handshake_lock:
+        handshake = _addon_handshake
+    if handshake is None or handshake.source != "native" or not handshake.up_to_date:
+        raise RuntimeError(
+            "BLENDER_ADDON_PROTOCOL_UNSUPPORTED: update the Blender Add-on to protocol "
+            f"{EXPECTED_ADDON_PROTOCOL_VERSION}, then restart Blender or re-enable the Add-on."
+        )
+    missing = sorted(required - set(handshake.capabilities))
+    if missing:
+        raise RuntimeError(
+            "BLENDER_ADDON_CAPABILITY_MISSING: connected Add-on does not advertise "
+            + ", ".join(missing)
+            + ". Update the Add-on and restart Blender."
+        )
+
+
+def _request_scene_asset_roots() -> dict[str, Any]:
+    blender = get_blender_connection()
+    _require_addon_capabilities({"discover_scene_asset_roots"})
+    return blender.send_command("discover_scene_asset_roots", {})
+
+
 def create_blend_snapshot(
     filepath: str,
     *,
     closure_mode: str = "ASSET_CLOSURE",
+    root_object_names: list[str] | None = None,
+    expected_scene_fingerprint: str | None = None,
 ) -> Dict[str, Any]:
-    """Ask the GUI Add-on to snapshot CURRENT_SELECTION on Blender's main thread."""
+    """Snapshot current selection as one asset or explicit scene roots as one asset."""
     valid_modes = {"SELECTED_ONLY", "INCLUDE_DESCENDANTS", "ASSET_CLOSURE"}
     if not isinstance(filepath, str) or not filepath:
         raise ValueError("filepath must be a non-empty string")
@@ -364,14 +580,29 @@ def create_blend_snapshot(
             "Run `uvx blender-mcp install-addon`, then restart Blender or re-enable the Add-on."
         )
 
-    return blender.send_command(
-        "create_blend_snapshot",
-        {
+    if root_object_names is None:
+        if expected_scene_fingerprint is not None:
+            raise ValueError("expected_scene_fingerprint requires root_object_names")
+        selection_mode = "CURRENT_SELECTION"
+        params = {
             "filepath": filepath,
-            "selectionMode": "CURRENT_SELECTION",
+            "selectionMode": selection_mode,
             "closureMode": closure_mode,
-        },
-    )
+        }
+    else:
+        _require_addon_capabilities({"create_blend_snapshot_explicit_roots"})
+        if not isinstance(expected_scene_fingerprint, str) or len(expected_scene_fingerprint) != 64:
+            raise ValueError("explicit root snapshot requires a SHA-256 scene fingerprint")
+        selection_mode = "EXPLICIT_ROOTS"
+        params = {
+            "filepath": filepath,
+            "selectionMode": selection_mode,
+            "closureMode": closure_mode,
+            "rootObjectNames": root_object_names,
+            "expectedSceneFingerprint": expected_scene_fingerprint,
+        }
+
+    return blender.send_command("create_blend_snapshot", params)
 
 
 @mcp.tool()
@@ -536,7 +767,17 @@ def get_prepared_artifact_transfer_service() -> PreparedArtifactTransferService:
     return _prepared_artifact_transfer_service
 
 
-def _validate_prepare_source(source: Dict[str, Any]) -> tuple[str, Path | None]:
+def _model_to_dict(value: Any, *, by_alias: bool = False) -> dict[str, Any]:
+    if isinstance(value, BaseModel):
+        return value.model_dump(by_alias=by_alias, exclude_none=True, exclude_unset=True)
+    if isinstance(value, Mapping):
+        return dict(value)
+    raise _PrepareBlendAssetInputError("PREPARE_INVALID_ARGUMENT", "expected an object")
+
+
+def _validate_prepare_source(source: PrepareBlendSource | Dict[str, Any]) -> tuple[str, Path | None]:
+    if isinstance(source, BaseModel):
+        source = _model_to_dict(source)
     if not isinstance(source, dict):
         raise _PrepareBlendAssetInputError(
             "PREPARE_INVALID_SOURCE", "source must be an object"
@@ -586,6 +827,8 @@ def _normalize_prepare_overrides(overrides: Dict[str, Any] | None) -> Dict[str, 
     """
     if overrides is None or overrides == {}:
         return {}
+    if isinstance(overrides, BaseModel):
+        overrides = _model_to_dict(overrides)
     if not isinstance(overrides, dict):
         raise _PrepareBlendAssetInputError(
             "PREPARE_INVALID_OVERRIDES", "overrides must be an object"
@@ -776,9 +1019,9 @@ def _prepare_blend_asset_content(result: Dict[str, Any], profile: str) -> CallTo
 
 @mcp.tool()
 async def prepare_blend_asset(
-    source: Dict[str, Any],
-    profile: str,
-    overrides: Dict[str, Any] | None = None,
+    source: PrepareBlendSource,
+    profile: Annotated[str, Field(description="Preparation profile.", json_schema_extra={"enum": ["PREVIEW", "METADATA", "PUBLISH"]})],
+    overrides: PrepareOverrides | None = None,
 ) -> CallToolResult:
     """Prepare exactly one logical asset from one .blend or current selection.
 
@@ -1313,14 +1556,488 @@ def discover_blend_files(directory: str) -> CallToolResult:
         return _prepare_blend_asset_error("BLEND_DISCOVERY_FAILED", "Blend file discovery failed")
 
 
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _scene_batch_item_descriptors(items: list[SceneAssetBatchItem]) -> list[dict[str, Any]]:
+    return [
+        {
+            "assetKey": item.asset_key,
+            "rootObjectIds": sorted(item.root_object_ids),
+            "displayName": item.display_name,
+            "dependencyPolicy": item.dependency_policy,
+        }
+        for item in items
+    ]
+
+
+def _cleanup_orphaned_scene_batch_snapshots() -> None:
+    global _scene_batch_startup_cleanup_done
+    with _scene_batch_manifest_lock:
+        if _scene_batch_startup_cleanup_done:
+            return
+        if _SCENE_BATCH_ROOT.exists():
+            for child in _SCENE_BATCH_ROOT.iterdir():
+                if child.is_symlink():
+                    child.unlink(missing_ok=True)
+                elif child.is_dir():
+                    shutil.rmtree(child)
+                elif child.is_file():
+                    child.unlink(missing_ok=True)
+        _scene_batch_manifest_paths.clear()
+        _scene_batch_startup_cleanup_done = True
+
+
+def _scene_batch_manifest_path(idempotency_key: str) -> Path:
+    key_hash = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+    return _SCENE_BATCH_ROOT / key_hash / "manifest.json"
+
+
+def _write_scene_batch_manifest(path: Path, manifest: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
+def _read_scene_batch_manifest(path: Path) -> dict[str, Any]:
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise _PrepareBlendAssetInputError(
+            "SCENE_BATCH_MANIFEST_CORRUPT",
+            "the retained scene-batch snapshot manifest cannot be read",
+        ) from exc
+    if not isinstance(manifest, dict) or manifest.get("schemaVersion") != 1:
+        raise _PrepareBlendAssetInputError(
+            "SCENE_BATCH_MANIFEST_CORRUPT",
+            "the retained scene-batch snapshot manifest has an unsupported format",
+        )
+    return manifest
+
+
+def _scene_batch_manager_items(
+    manifest: dict[str, Any],
+    requested_items: list[SceneAssetBatchItem],
+) -> list[dict[str, Any]]:
+    manifest_items = manifest.get("items")
+    if not isinstance(manifest_items, list):
+        raise _PrepareBlendAssetInputError(
+            "SCENE_BATCH_MANIFEST_CORRUPT",
+            "the retained scene-batch manifest has no item list",
+        )
+    by_key = {
+        item.get("assetKey"): item
+        for item in manifest_items
+        if isinstance(item, dict) and isinstance(item.get("assetKey"), str)
+    }
+    result = []
+    for requested in requested_items:
+        existing = by_key.get(requested.asset_key)
+        if existing is None:
+            raise _PrepareBlendAssetInputError(
+                "SCENE_BATCH_ITEM_NOT_IN_MANIFEST",
+                f"asset_key {requested.asset_key!r} is not part of the original scene batch",
+            )
+        if sorted(existing.get("rootObjectIds") or []) != sorted(requested.root_object_ids):
+            raise _PrepareBlendAssetInputError(
+                "SCENE_BATCH_ROOT_ASSIGNMENT_MISMATCH",
+                f"root_object_ids for asset_key {requested.asset_key!r} differ from the original batch",
+            )
+        if existing.get("dependencyPolicy") != requested.dependency_policy:
+            raise _PrepareBlendAssetInputError(
+                "SCENE_BATCH_DEPENDENCY_POLICY_MISMATCH",
+                f"dependency_policy for asset_key {requested.asset_key!r} differs from the original batch",
+            )
+        original_display_name = existing.get("sourceDisplayName")
+        if not isinstance(original_display_name, str) or not original_display_name.strip():
+            raise _PrepareBlendAssetInputError(
+                "SCENE_BATCH_MANIFEST_CORRUPT",
+                f"sourceDisplayName for asset_key {requested.asset_key!r} is missing or invalid",
+            )
+        if (
+            requested.display_name is not None
+            and requested.display_name != original_display_name
+        ):
+            raise _PrepareBlendAssetInputError(
+                "SCENE_BATCH_DISPLAY_NAME_MISMATCH",
+                f"display_name for asset_key {requested.asset_key!r} differs from the original batch",
+            )
+        path = Path(existing.get("path", "")).resolve()
+        manifest_dir = Path(manifest.get("_manifestPath", "")).resolve().parent
+        if path.parent != manifest_dir or path.suffix.lower() != ".blend":
+            raise _PrepareBlendAssetInputError(
+                "SCENE_BATCH_MANIFEST_CORRUPT",
+                "a retained scene snapshot path is outside its managed batch directory",
+            )
+        result.append(
+            {
+                "itemKey": requested.asset_key,
+                "path": str(path),
+                "sourceFingerprint": existing.get("sourceFingerprint"),
+                "sourceDisplayName": original_display_name,
+            }
+        )
+    return result
+
+
+def _resolve_scene_batch_sources(
+    scene_fingerprint: str,
+    items: list[SceneAssetBatchItem],
+    idempotency_key: str,
+    batch_prepare_id: str | None,
+) -> tuple[Path, list[dict[str, Any]]]:
+    _cleanup_orphaned_scene_batch_snapshots()
+    if not items:
+        raise _PrepareBlendAssetInputError(
+            "SCENE_BATCH_ITEMS_REQUIRED", "at least one logical asset item is required"
+        )
+    asset_keys = [item.asset_key for item in items]
+    if len(set(asset_keys)) != len(asset_keys):
+        raise _PrepareBlendAssetInputError(
+            "SCENE_BATCH_DUPLICATE_ASSET_KEY", "asset_key values must be unique"
+        )
+    assigned_roots = [
+        root_id
+        for item in items
+        for root_id in item.root_object_ids
+    ]
+    if len(set(assigned_roots)) != len(assigned_roots):
+        raise _PrepareBlendAssetInputError(
+            "SCENE_BATCH_DUPLICATE_ROOT_OBJECT",
+            "a root_object_id may belong to only one logical asset in a batch",
+        )
+
+    descriptors = _scene_batch_item_descriptors(items)
+    with _scene_batch_manifest_lock:
+        if batch_prepare_id is not None:
+            manifest_path = _scene_batch_manifest_paths.get(batch_prepare_id)
+            if manifest_path is None or not manifest_path.is_file():
+                raise _PrepareBlendAssetInputError(
+                    "SCENE_BATCH_CONTEXT_NOT_FOUND",
+                    "the original scene-batch snapshot context is unavailable; rediscover the scene and start a new batch",
+                )
+            manifest = _read_scene_batch_manifest(manifest_path)
+            manifest["_manifestPath"] = str(manifest_path)
+            if manifest.get("batchPrepareId") != batch_prepare_id:
+                raise _PrepareBlendAssetInputError(
+                    "SCENE_BATCH_CONTEXT_MISMATCH",
+                    "the retained scene-batch manifest does not match batch_prepare_id",
+                )
+            if manifest.get("sceneFingerprint") != scene_fingerprint.lower():
+                raise _PrepareBlendAssetInputError(
+                    "SCENE_BATCH_SCENE_FINGERPRINT_MISMATCH",
+                    "scene_fingerprint differs from the original batch; retry must use the original immutable scene snapshots",
+                )
+            return manifest_path, _scene_batch_manager_items(manifest, items)
+
+        if len(items) < 2:
+            raise _PrepareBlendAssetInputError(
+                "SCENE_BATCH_MIN_ITEMS",
+                "an initial scene-object batch requires at least two logical assets; use prepare_blend_asset for one asset",
+            )
+
+        manifest_path = _scene_batch_manifest_path(idempotency_key)
+        request_payload = {
+            "sceneFingerprint": scene_fingerprint.lower(),
+            "items": descriptors,
+            "profile": "PUBLISH",
+        }
+        request_fingerprint = hashlib.sha256(
+            json.dumps(request_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+        if manifest_path.is_file():
+            manifest = _read_scene_batch_manifest(manifest_path)
+            if manifest.get("requestFingerprint") != request_fingerprint:
+                raise _PrepareBlendAssetInputError(
+                    "SCENE_BATCH_IDEMPOTENCY_CONFLICT",
+                    "idempotency_key was already used for different scene assets or root assignments",
+                )
+            manifest["_manifestPath"] = str(manifest_path)
+            manager_items = _scene_batch_manager_items(manifest, items)
+            for item in manager_items:
+                path = Path(item["path"])
+                if not path.is_file() or _sha256_file(path) != item["sourceFingerprint"]:
+                    raise _PrepareBlendAssetInputError(
+                        "SCENE_BATCH_SNAPSHOT_MISSING",
+                        f"retained snapshot for asset_key {item['itemKey']!r} is missing or changed",
+                    )
+            return manifest_path, manager_items
+
+        roots = _request_scene_asset_roots()
+        current_fingerprint = roots.get("sceneFingerprint") if isinstance(roots, dict) else None
+        if current_fingerprint != scene_fingerprint.lower():
+            raise _PrepareBlendAssetInputError(
+                "SCENE_CHANGED",
+                "the active Blender scene changed after discovery; call discover_scene_asset_roots again",
+            )
+        raw_roots = roots.get("roots") if isinstance(roots, dict) else None
+        if not isinstance(raw_roots, list):
+            raise _PrepareBlendAssetInputError(
+                "SCENE_ASSET_DISCOVERY_INVALID",
+                "discover_scene_asset_roots returned an invalid root manifest",
+            )
+        root_names = {
+            raw.get("rootObjectId"): raw.get("objectName")
+            for raw in raw_roots
+            if isinstance(raw, dict)
+            and isinstance(raw.get("rootObjectId"), str)
+            and isinstance(raw.get("objectName"), str)
+        }
+        unknown_roots = sorted(set(assigned_roots) - set(root_names))
+        if unknown_roots:
+            raise _PrepareBlendAssetInputError(
+                "SCENE_ASSET_ROOT_NOT_FOUND",
+                "one or more root_object_ids are not present in the current scene manifest: "
+                + ", ".join(unknown_roots),
+            )
+
+        batch_dir = manifest_path.parent
+        if batch_dir.exists():
+            shutil.rmtree(batch_dir)
+        batch_dir.mkdir(parents=True, exist_ok=False)
+        manifest_items = []
+        try:
+            for item in items:
+                names = [root_names[root_id] for root_id in item.root_object_ids]
+                snapshot_path = batch_dir / f"{item.asset_key}.blend"
+                snapshot = create_blend_snapshot(
+                    str(snapshot_path),
+                    closure_mode="ASSET_CLOSURE",
+                    root_object_names=names,
+                    expected_scene_fingerprint=scene_fingerprint.lower(),
+                )
+                if snapshot.get("sourceSceneFingerprint") != scene_fingerprint.lower():
+                    raise _PrepareBlendAssetInputError(
+                        "SCENE_CHANGED",
+                        "the active Blender scene changed while asset snapshots were being created",
+                    )
+                if not snapshot_path.is_file() or snapshot_path.stat().st_size <= 0:
+                    raise _PrepareBlendAssetInputError(
+                        "SCENE_BATCH_SNAPSHOT_NOT_CREATED",
+                        f"Blender did not create a non-empty snapshot for asset_key {item.asset_key!r}",
+                    )
+                manifest_items.append(
+                    {
+                        "assetKey": item.asset_key,
+                        "rootObjectIds": sorted(item.root_object_ids),
+                        "rootObjectNames": sorted(names),
+                        "dependencyPolicy": item.dependency_policy,
+                        "sourceDisplayName": item.display_name or item.asset_key,
+                        "path": str(snapshot_path.resolve()),
+                        "sourceFingerprint": _sha256_file(snapshot_path),
+                    }
+                )
+            manifest = {
+                "schemaVersion": 1,
+                "requestFingerprint": request_fingerprint,
+                "sceneFingerprint": scene_fingerprint.lower(),
+                "profile": "PUBLISH",
+                "batchPrepareId": None,
+                "items": manifest_items,
+            }
+            _write_scene_batch_manifest(manifest_path, manifest)
+        except Exception:
+            shutil.rmtree(batch_dir, ignore_errors=True)
+            raise
+
+        manifest["_manifestPath"] = str(manifest_path)
+        return manifest_path, _scene_batch_manager_items(manifest, items)
+
+
+@mcp.tool()
+def discover_scene_asset_roots() -> SceneAssetRootDiscoveryResult:
+    """Read-only discovery of independent top-level asset-root candidates in the active Blender scene.
+
+    Returns root_object_id values scoped to scene_fingerprint. A root and its
+    parented descendants form one candidate. Multiple independent roots may be
+    grouped into one logical asset by placing their IDs together in one
+    start_prepare_scene_assets item. This tool does not change selection or scene state.
+    """
+    try:
+        raw = _request_scene_asset_roots()
+        roots = raw.get("roots") if isinstance(raw, dict) else None
+        fingerprint = raw.get("sceneFingerprint") if isinstance(raw, dict) else None
+        if not isinstance(roots, list):
+            raise ValueError("SCENE_ASSET_DISCOVERY_INVALID: Add-on returned no root list")
+        if (
+            not isinstance(fingerprint, str)
+            or len(fingerprint) != 64
+            or any(char not in "0123456789abcdef" for char in fingerprint)
+        ):
+            raise ValueError("SCENE_ASSET_DISCOVERY_INVALID: Add-on returned an invalid scene fingerprint")
+        return SceneAssetRootDiscoveryResult(
+            ok=True,
+            scene_fingerprint=fingerprint,
+            scene_name=raw.get("sceneName"),
+            source_blend_path=raw.get("sourceBlendPath"),
+            blender_version=raw.get("blenderVersion"),
+            scene_object_count=raw.get("sceneObjectCount", 0),
+            roots=[
+                SceneAssetRoot(
+                    root_object_id=item["rootObjectId"],
+                    object_name=item["objectName"],
+                    object_type=item["objectType"],
+                    data_name=item.get("dataName"),
+                    collection_names=item.get("collectionNames") or [],
+                    descendant_object_ids=item.get("descendantObjectIds") or [],
+                    descendant_object_names=item.get("descendantObjectNames") or [],
+                    object_count=item["objectCount"],
+                    geometry_object_count=item["geometryObjectCount"],
+                )
+                for item in roots
+            ],
+        )
+    except Exception as exc:
+        message = str(exc)
+        code, separator, detail = message.partition(":")
+        if not separator or not code.isupper() or not all(char.isalnum() or char == "_" for char in code):
+            code, detail = "SCENE_ASSET_DISCOVERY_FAILED", message
+        return SceneAssetRootDiscoveryResult(
+            ok=False,
+            error=SceneAssetToolError(code=code, message=detail.strip() or message),
+        )
+
+
+@mcp.tool()
+async def start_prepare_scene_assets(
+    scene_fingerprint: Annotated[
+        str,
+        Field(
+            min_length=64,
+            max_length=64,
+            pattern=r"^[0-9a-fA-F]{64}$",
+            description="Exact scene_fingerprint returned by discover_scene_asset_roots. Do not reuse after the scene changes.",
+        ),
+    ],
+    items: Annotated[
+        list[SceneAssetBatchItem],
+        Field(
+            min_length=1,
+            max_length=64,
+            description="Each item is one logical asset. Initial batches require at least 2 items; retries may submit only failed item(s). Group multiple root_object_ids in one item only when they jointly form one logical asset.",
+        ),
+    ],
+    idempotency_key: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=128,
+            description="Stable key for this exact start/retry request. Reuse it only when replaying the same request after response loss; use a new key for a distinct retry subset.",
+        ),
+    ],
+    batch_prepare_id: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=128,
+            description="Omit for the initial scene batch. Supply the existing local batch ID only when retrying item(s) from that same batch.",
+        ),
+    ] | None = None,
+    concurrency: Annotated[
+        int | None,
+        Field(ge=1, le=12, description="Optional per-request worker concurrency; omit to use the server-selected default."),
+    ] = None,
+) -> SceneAssetBatchStartResult:
+    """Create one isolated .blend snapshot per logical scene asset and start the existing PUBLISH batch pipeline.
+
+    This is for multiple independent models in the currently open Blender scene,
+    not for multiple .blend files. Every root_object_id must come from the same
+    discover_scene_asset_roots result. The tool never changes GUI selection and
+    preserves the original scene. It returns the existing batch_prepare_id contract,
+    plus itemKey/sourceDisplayName/sourceFingerprint identities for registering the
+    matching AssetPlatform import batch. Local snapshot paths are never returned.
+    get_prepare_blend_assets, inspect_prepared_assets and upload tools are reused.
+    """
+    try:
+        manifest_path, manager_items = await asyncio.to_thread(
+            _resolve_scene_batch_sources,
+            scene_fingerprint,
+            items,
+            idempotency_key,
+            batch_prepare_id,
+        )
+        result = await get_asset_pipeline_manager().start_prepare_blend_assets(
+            manager_items,
+            "PUBLISH",
+            idempotency_key,
+            batch_prepare_id=batch_prepare_id,
+            concurrency=concurrency,
+        )
+        actual_batch_id = result["batchPrepareId"]
+        with _scene_batch_manifest_lock:
+            manifest = _read_scene_batch_manifest(manifest_path)
+            manifest["batchPrepareId"] = actual_batch_id
+            _write_scene_batch_manifest(manifest_path, manifest)
+            _scene_batch_manifest_paths[actual_batch_id] = manifest_path
+        manifest_by_key = {
+            item["assetKey"]: item
+            for item in manifest.get("items", [])
+            if isinstance(item, dict) and isinstance(item.get("assetKey"), str)
+        }
+        source_items = [
+            SceneAssetBatchSourceItem(
+                item_key=item["itemKey"],
+                source_display_name=item["sourceDisplayName"],
+                source_fingerprint=item["sourceFingerprint"],
+                root_object_ids=manifest_by_key[item["itemKey"]]["rootObjectIds"],
+                root_object_names=manifest_by_key[item["itemKey"]]["rootObjectNames"],
+            )
+            for item in manager_items
+        ]
+        return SceneAssetBatchStartResult(
+            ok=True,
+            batch_prepare_id=actual_batch_id,
+            status=result["status"],
+            item_count=result["itemCount"],
+            concurrency=result.get("concurrency"),
+            items=source_items,
+        )
+    except _PrepareBlendAssetInputError as exc:
+        return SceneAssetBatchStartResult(
+            ok=False,
+            status="ERROR",
+            error=SceneAssetToolError(code=exc.code, message=exc.message),
+        )
+    except AssetBatchError as exc:
+        return SceneAssetBatchStartResult(
+            ok=False,
+            status="ERROR",
+            error=SceneAssetToolError(code=exc.code, message=exc.message),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.exception("start_prepare_scene_assets failed")
+        message = str(exc)
+        code, separator, detail = message.partition(":")
+        if not separator or not code.isupper() or not all(char.isalnum() or char == "_" for char in code):
+            code, detail = "SCENE_BATCH_PREPARE_FAILED", message
+        return SceneAssetBatchStartResult(
+            ok=False,
+            status="ERROR",
+            error=SceneAssetToolError(code=code, message=detail.strip() or message),
+        )
+
+
 @mcp.tool()
 async def start_prepare_blend_assets(
-    items: List[Dict[str, Any]],
-    profile: str,
-    idempotency_key: str,
+    items: Annotated[list[BlendFileBatchItem], Field(min_length=1, description="Each item is one independent on-disk .blend file; this API does not accept scene objects.")],
+    profile: Literal["PREVIEW", "METADATA", "PUBLISH"],
+    idempotency_key: Annotated[str, Field(min_length=1, max_length=128)],
     batch_prepare_id: str | None = None,
-    concurrency: int | None = None,
-    overrides: Dict[str, Any] | None = None,
+    concurrency: Annotated[int | None, Field(ge=1, le=12)] = None,
+    overrides: PrepareOverrides | None = None,
 ) -> CallToolResult:
     """Start or retry an asynchronous file-based batch prepare job.
 
@@ -1330,9 +2047,15 @@ async def start_prepare_blend_assets(
     """
 
     try:
-        _validate_prepare_overrides(overrides)
+        normalized_overrides = _normalize_prepare_overrides(overrides)
+        if normalized_overrides:
+            raise _PrepareBlendAssetInputError(
+                "BATCH_PREPARE_OVERRIDES_UNSUPPORTED",
+                "file batch prepare does not apply per-item preview overrides; prepare each file with the default profile settings",
+            )
+        normalized_items = [_model_to_dict(item, by_alias=True) for item in items]
         result = await get_asset_pipeline_manager().start_prepare_blend_assets(
-            items,
+            normalized_items,
             profile,
             idempotency_key,
             batch_prepare_id=batch_prepare_id,
@@ -1361,10 +2084,10 @@ async def start_prepare_blend_assets(
 
 @mcp.tool()
 def get_prepare_blend_assets(
-    batch_prepare_id: str,
+    batch_prepare_id: Annotated[str, Field(min_length=1)],
     cursor: str | None = None,
-    limit: int = 50,
-    mode: str = "LEGACY_FULL",
+    limit: Annotated[int, Field(ge=1, le=100)] = 50,
+    mode: Literal["STATUS", "LEGACY_FULL"] = "LEGACY_FULL",
 ) -> CallToolResult:
     """Read batch state; STATUS is lightweight while LEGACY_FULL preserves preview-compatible output."""
 
@@ -1411,8 +2134,8 @@ async def cancel_prepare_blend_assets(batch_prepare_id: str) -> CallToolResult:
 
 @mcp.tool()
 async def inspect_prepared_assets(
-    batch_prepare_id: str,
-    items: List[Dict[str, str]],
+    batch_prepare_id: Annotated[str, Field(min_length=1)],
+    items: Annotated[list[PreparedAssetWindowItem], Field(min_length=1, description="A bounded window of 1-16 item_key + prepare_id pairs returned by the same prepare batch.", json_schema_extra={"maxItems": 16})],
 ) -> CallToolResult:
     """Return one bounded AI-ready window of compact facts plus adjacent MAIN previews."""
 
@@ -1428,7 +2151,8 @@ async def inspect_prepared_assets(
         )
 
     normalized: list[Dict[str, str]] = []
-    for raw in items:
+    for raw_model in items:
+        raw = _model_to_dict(raw_model)
         if not isinstance(raw, dict):
             return _prepare_blend_asset_error(
                 "BATCH_PREPARE_WINDOW_ITEM_INVALID",
@@ -1623,18 +2347,28 @@ async def upload_prepared_artifact(
 
 @mcp.tool()
 async def start_upload_prepared_artifacts(
-    batch_prepare_id: str,
-    items: List[Dict[str, Any]],
-    idempotency_key: str,
-    upload_id: str | None = None,
-    concurrency: int | None = None,
+    batch_prepare_id: Annotated[
+        str,
+        Field(min_length=1, max_length=128, description="Local Blender MCP preparation batch ID that owns every supplied artifactId."),
+    ],
+    items: Annotated[list[PreparedArtifactUploadItem], Field(min_length=1, description="One item per unique artifactId; an itemKey may repeat for PAYLOAD, MAIN PREVIEW, and VIEWER artifacts. Match each URL/method/headers/size/hash to the AssetPlatform grant for that exact artifact.")],
+    idempotency_key: Annotated[
+        str,
+        Field(min_length=1, max_length=128, description="Stable key for this exact upload request; reuse it when replaying after response loss.")
+    ],
+    upload_id: Annotated[
+        str,
+        Field(min_length=1, max_length=128, description="Existing uploadId to resume/replay that upload job; omit when starting a new upload job.")
+    ] | None = None,
+    concurrency: Annotated[int | None, Field(ge=1, le=12, description="Optional upload worker concurrency; omit to use the server-selected default.")] = None,
 ) -> CallToolResult:
     """Start or retry an asynchronous upload job; one itemKey may carry multiple artifactId values."""
 
     try:
+        normalized_items = [_model_to_dict(item, by_alias=True) for item in items]
         result = await get_prepared_artifact_transfer_service().start_upload_prepared_artifacts(
             batch_prepare_id,
-            items,
+            normalized_items,
             idempotency_key,
             upload_id=upload_id,
             concurrency=concurrency,
@@ -1656,8 +2390,8 @@ async def start_upload_prepared_artifacts(
 
 @mcp.tool()
 def get_upload_prepared_artifacts(
-    upload_id: str,
-    cursor: str | None = None,
+    upload_id: Annotated[str, Field(min_length=1, max_length=128, description="uploadId returned by start_upload_prepared_artifacts.")],
+    cursor: Annotated[str, Field(min_length=1, max_length=512)] | None = None,
 ) -> CallToolResult:
     """Return one bounded page of a local prepared-artifact upload job."""
 
@@ -1680,7 +2414,9 @@ def get_upload_prepared_artifacts(
 
 
 @mcp.tool()
-async def cancel_upload_prepared_artifacts(upload_id: str) -> CallToolResult:
+async def cancel_upload_prepared_artifacts(
+    upload_id: Annotated[str, Field(min_length=1, max_length=128, description="uploadId returned by start_upload_prepared_artifacts.")]
+) -> CallToolResult:
     """Cancel active work for a local prepared-artifact upload job."""
 
     try:

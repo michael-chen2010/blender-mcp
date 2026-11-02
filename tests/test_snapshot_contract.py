@@ -7,6 +7,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 from conftest import ROOT_ADDON
 
 
@@ -28,10 +30,19 @@ class FakeMaterial(FakeID):
         )
 
 
+class FakeVertex:
+    def __init__(self, co):
+        self.co = tuple(co)
+
+
 class FakeMesh(FakeID):
     def __init__(self, name: str, materials=()):
         super().__init__(name)
         self.materials = list(materials)
+        self.vertices = [FakeVertex((0.0, 0.0, 0.0)), FakeVertex((1.0, 0.0, 0.0))]
+        self.edges = []
+        self.loops = []
+        self.polygons = []
 
 
 class FakeObject(FakeID):
@@ -43,6 +54,7 @@ class FakeObject(FakeID):
         self.parent = None
         self.modifiers = []
         self.constraints = []
+        self.users_collection = []
         self.location = (0.0, 0.0, 0.0)
         self.rotation_euler = (0.0, 0.0, 0.0)
         self.scale = (1.0, 1.0, 1.0)
@@ -51,6 +63,7 @@ class FakeObject(FakeID):
 def _load_addon(monkeypatch, *, selected_objects=(), all_objects=(), libraries=None):
     scene = types.SimpleNamespace(
         name="Scene",
+        objects=list(all_objects),
         blendermcp_use_polyhaven=False,
         blendermcp_use_hyper3d=False,
         blendermcp_use_sketchfab=False,
@@ -169,14 +182,16 @@ def _asset_fixture():
     }
 
 
-def test_snapshot_capability_is_protocol_v6_and_advertised(monkeypatch):
+def test_snapshot_capability_is_protocol_v7_and_advertised(monkeypatch):
     addon, _bpy = _load_addon(monkeypatch)
     server = addon.BlenderMCPServer()
 
     info = server.get_addon_info()
 
-    assert addon.ADDON_PROTOCOL_VERSION == 6
+    assert addon.ADDON_PROTOCOL_VERSION == 7
     assert "create_blend_snapshot" in info["capabilities"]
+    assert "create_blend_snapshot_explicit_roots" in info["capabilities"]
+    assert "discover_scene_asset_roots" in info["capabilities"]
 
 
 def test_asset_closure_includes_hierarchy_and_required_dependencies(monkeypatch):
@@ -336,4 +351,180 @@ def test_server_snapshot_adapter_sends_exact_addon_command(monkeypatch, tmp_path
             },
         )
     ]
+
+
+def test_discover_scene_asset_roots_returns_hierarchy_roots_and_scene_fingerprint(monkeypatch):
+    fixture = _asset_fixture()
+    addon, bpy = _load_addon(monkeypatch, all_objects=fixture["all"])
+    server = addon.BlenderMCPServer()
+
+    result = server.discover_scene_asset_roots()
+
+    assert len(result["sceneFingerprint"]) == 64
+    assert result["sceneObjectCount"] == len(fixture["all"])
+    roots = {item["objectName"]: item for item in result["roots"]}
+    assert set(roots) == {"Root", "Loose"}
+    assert roots["Root"]["descendantObjectNames"] == ["Child"]
+    assert roots["Root"]["geometryObjectCount"] == 2
+    assert roots["Loose"]["geometryObjectCount"] == 1
+    assert len({item["rootObjectId"] for item in roots.values()}) == 2
+    before_ids = {name: item["rootObjectId"] for name, item in roots.items()}
+    bpy.context.selected_objects[:] = [fixture["loose"]]
+    selection_independent = server.discover_scene_asset_roots()
+    assert selection_independent["sceneFingerprint"] == result["sceneFingerprint"]
+    assert {item["objectName"]: item["rootObjectId"] for item in selection_independent["roots"]} == before_ids
+
+
+def test_scene_fingerprint_changes_when_mesh_geometry_changes(monkeypatch):
+    fixture = _asset_fixture()
+    addon, _bpy = _load_addon(monkeypatch, all_objects=fixture["all"])
+    server = addon.BlenderMCPServer()
+    before = server.discover_scene_asset_roots()
+
+    fixture["mesh"].vertices[0].co = (0.25, 0.0, 0.0)
+    after = server.discover_scene_asset_roots()
+
+    assert after["sceneFingerprint"] != before["sceneFingerprint"]
+
+
+def test_scene_fingerprint_changes_when_modifier_settings_change(monkeypatch):
+    fixture = _asset_fixture()
+    modifier = types.SimpleNamespace(
+        name="Subdivision",
+        type="SUBSURF",
+        levels=2,
+        render_levels=3,
+        show_viewport=True,
+        show_render=True,
+        bl_rna=types.SimpleNamespace(
+            properties=[
+                types.SimpleNamespace(identifier="name", type="STRING"),
+                types.SimpleNamespace(identifier="type", type="ENUM"),
+                types.SimpleNamespace(identifier="levels", type="INT"),
+                types.SimpleNamespace(identifier="render_levels", type="INT"),
+                types.SimpleNamespace(identifier="show_viewport", type="BOOLEAN"),
+                types.SimpleNamespace(identifier="show_render", type="BOOLEAN"),
+            ]
+        ),
+    )
+    fixture["root"].modifiers.append(modifier)
+    addon, _bpy = _load_addon(monkeypatch, all_objects=fixture["all"])
+    server = addon.BlenderMCPServer()
+    before = server.discover_scene_asset_roots()
+
+    modifier.levels = 4
+    after = server.discover_scene_asset_roots()
+
+    assert after["sceneFingerprint"] != before["sceneFingerprint"]
+
+
+def test_scene_fingerprint_changes_when_constraint_settings_change(monkeypatch):
+    fixture = _asset_fixture()
+    constraint = fixture["loose"].constraints[0]
+    constraint.influence = 1.0
+    constraint.bl_rna = types.SimpleNamespace(
+        properties=[
+            types.SimpleNamespace(identifier="type", type="ENUM"),
+            types.SimpleNamespace(identifier="target", type="POINTER"),
+            types.SimpleNamespace(identifier="influence", type="FLOAT"),
+        ]
+    )
+    addon, _bpy = _load_addon(monkeypatch, all_objects=fixture["all"])
+    server = addon.BlenderMCPServer()
+    before = server.discover_scene_asset_roots()
+
+    constraint.influence = 0.25
+    after = server.discover_scene_asset_roots()
+
+    assert after["sceneFingerprint"] != before["sceneFingerprint"]
+
+
+def test_discover_scene_asset_roots_excludes_pole_target_as_dependency(monkeypatch):
+    fixture = _asset_fixture()
+    pole_target = FakeObject(
+        "PoleTarget",
+        obj_type="MESH",
+        data=FakeMesh("PoleTargetMesh"),
+    )
+    fixture["loose"].constraints[0].pole_target = pole_target
+    fixture["all"].append(pole_target)
+    addon, _bpy = _load_addon(monkeypatch, all_objects=fixture["all"])
+
+    result = addon.BlenderMCPServer().discover_scene_asset_roots()
+
+    root_names = {root["objectName"] for root in result["roots"]}
+    assert {"Root", "Loose"} <= root_names
+    assert "PoleTarget" not in root_names
+
+
+def test_discover_scene_asset_roots_keeps_armature_parent_as_asset_root(monkeypatch):
+    rig = FakeObject("CharacterRig", obj_type="ARMATURE", data=FakeID("CharacterRigData"))
+    body = FakeObject("CharacterBody", obj_type="MESH", data=FakeMesh("CharacterBodyMesh"))
+    body.parent = rig
+    rig.children.append(body)
+    body.modifiers.append(types.SimpleNamespace(type="ARMATURE", object=rig))
+    addon, _bpy = _load_addon(monkeypatch, all_objects=[rig, body])
+    server = addon.BlenderMCPServer()
+
+    result = server.discover_scene_asset_roots()
+
+    assert [root["objectName"] for root in result["roots"]] == ["CharacterRig"]
+    assert result["roots"][0]["descendantObjectNames"] == ["CharacterBody"]
+
+
+def test_explicit_root_snapshot_isolated_and_does_not_change_gui_selection(monkeypatch, tmp_path: Path):
+    fixture = _asset_fixture()
+    recorded = {}
+
+    def write(filepath, datablocks, **kwargs):
+        recorded["filepath"] = filepath
+        recorded["datablocks"] = set(datablocks)
+        Path(filepath).write_bytes(b"BLENDER-explicit-snapshot")
+
+    addon, bpy = _load_addon(
+        monkeypatch,
+        selected_objects=[fixture["loose"]],
+        all_objects=fixture["all"],
+        libraries=types.SimpleNamespace(write=write),
+    )
+    server = addon.BlenderMCPServer()
+    discovery = server.discover_scene_asset_roots()
+    before_selection = tuple(bpy.context.selected_objects)
+    target = tmp_path / "root-only.blend"
+
+    result = server.create_blend_snapshot(
+        filepath=str(target),
+        selectionMode="EXPLICIT_ROOTS",
+        closureMode="ASSET_CLOSURE",
+        rootObjectNames=["Root"],
+        expectedSceneFingerprint=discovery["sceneFingerprint"],
+    )
+
+    assert tuple(bpy.context.selected_objects) == before_selection
+    assert fixture["root"] in recorded["datablocks"]
+    assert fixture["child"] in recorded["datablocks"]
+    assert fixture["armature"] in recorded["datablocks"]
+    assert fixture["target"] not in recorded["datablocks"]
+    assert fixture["loose"] not in recorded["datablocks"]
+    assert fixture["camera"] not in recorded["datablocks"]
+    assert result["rootObjectNames"] == ["Root"]
+    assert result["sourceSceneFingerprint"] == discovery["sceneFingerprint"]
+
+
+def test_explicit_root_snapshot_rejects_stale_scene_fingerprint(monkeypatch, tmp_path: Path):
+    fixture = _asset_fixture()
+    addon, _bpy = _load_addon(monkeypatch, all_objects=fixture["all"])
+    server = addon.BlenderMCPServer()
+    discovery = server.discover_scene_asset_roots()
+    fixture["loose"].location = (2.0, 0.0, 0.0)
+
+    with pytest.raises(ValueError, match="SCENE_CHANGED"):
+        server.create_blend_snapshot(
+            filepath=str(tmp_path / "stale.blend"),
+            selectionMode="EXPLICIT_ROOTS",
+            closureMode="ASSET_CLOSURE",
+            rootObjectNames=["Root"],
+            expectedSceneFingerprint=discovery["sceneFingerprint"],
+        )
+    assert not (tmp_path / "stale.blend").exists()
 

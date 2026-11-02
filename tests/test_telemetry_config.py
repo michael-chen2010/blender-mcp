@@ -48,8 +48,8 @@ def test_addon_status_works_without_private_config(monkeypatch, isolated_telemet
         def send_command(self, command):
             if command == "get_addon_info":
                 return {
-                    "protocol_version": 6,
-                    "addon_version": [1, 6],
+                    "protocol_version": 7,
+                    "addon_version": [1, 7],
                     "capabilities": ["create_blend_snapshot"],
                     "blender_version": "5.2.1",
                 }
@@ -62,7 +62,7 @@ def test_addon_status_works_without_private_config(monkeypatch, isolated_telemet
 
     status = json.loads(asyncio.run(server.get_addon_status(ctx=None)))
     assert status["up_to_date"] is True
-    assert status["protocol_version"] == 6
+    assert status["protocol_version"] == 7
     assert status["telemetry_consent"] is False
     assert telemetry.get_telemetry().config.enabled is False
 

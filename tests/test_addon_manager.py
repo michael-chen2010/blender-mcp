@@ -236,7 +236,7 @@ def test_handshake_exposes_local_blender_binary_path_when_reported():
     blender = MagicMock()
     blender.send_command.return_value = {
         "protocol_version": EXPECTED_ADDON_PROTOCOL_VERSION,
-        "addon_version": [1, 6],
+        "addon_version": [1, 7],
         "capabilities": ["get_addon_info"],
         "blender_version": "4.5.0",
         "blender_binary_path": "C:/Program Files/Blender Foundation/Blender/blender.exe",
@@ -256,19 +256,20 @@ def test_bundled_asset_prepare_worker_exists_next_to_addon():
     assert worker.is_file(), "packaged asset preparation worker is missing"
 
 
-def test_snapshot_protocol_bump_marks_v5_addon_outdated():
-    assert EXPECTED_ADDON_PROTOCOL_VERSION == 6
-    blender = MagicMock()
-    blender.send_command.return_value = {
-        "protocol_version": 5,
-        "addon_version": [1, 6],
-        "capabilities": ["get_addon_info"],
-        "blender_version": "4.5.0",
-    }
+def test_previous_addon_protocol_versions_are_outdated():
+    assert EXPECTED_ADDON_PROTOCOL_VERSION == 7
+    for old_protocol_version in (5, 6):
+        blender = MagicMock()
+        blender.send_command.return_value = {
+            "protocol_version": old_protocol_version,
+            "addon_version": [1, 6],
+            "capabilities": ["get_addon_info"],
+            "blender_version": "4.5.0",
+        }
 
-    result = handshake_addon(blender)
+        result = handshake_addon(blender)
 
-    assert result.up_to_date is False
-    assert result.protocol_version == 5
-    assert "expected 6" in (result.warning or "")
+        assert result.up_to_date is False
+        assert result.protocol_version == old_protocol_version
+    assert "expected 7" in (result.warning or "")
     assert "install-addon" in (result.warning or "")

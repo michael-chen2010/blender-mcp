@@ -1,3 +1,6 @@
+# MCP runtime state and temporary artifacts
+.mcp/
+
 # Python-generated files
 __pycache__/
 *.py[oc]

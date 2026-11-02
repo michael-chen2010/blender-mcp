@@ -4,6 +4,8 @@ import re
 import bpy
 import mathutils
 import json
+import array
+import struct
 import threading
 import socket
 import queue
@@ -29,7 +31,7 @@ from bpy.app.handlers import persistent
 bl_info = {
     "name": "MCP for Blender",
     "author": "BlenderMCP",
-    "version": (1, 6),
+    "version": (1, 7),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > MCP for Blender",
     "description": "Connect Blender to Claude via MCP",
@@ -37,7 +39,7 @@ bl_info = {
 }
 
 # Keep in sync with blender_mcp.addon_manager.EXPECTED_ADDON_PROTOCOL_VERSION.
-ADDON_PROTOCOL_VERSION = 6
+ADDON_PROTOCOL_VERSION = 7
 
 # Per-snapshot object cap for get_world_state_snapshot. Keep in sync with
 # blender_mcp.trajectory.MAX_SNAPSHOT_OBJECTS.
@@ -765,6 +767,7 @@ class BlenderMCPServer:
             "get_world_state_snapshot": self.get_world_state_snapshot,
             "get_addon_info": self.get_addon_info,
             "create_blend_snapshot": self.create_blend_snapshot,
+            "discover_scene_asset_roots": self.discover_scene_asset_roots,
             "get_object_info": self.get_object_info,
             "get_viewport_screenshot": self.get_viewport_screenshot,
             "execute_code": self.execute_code,
@@ -850,6 +853,8 @@ class BlenderMCPServer:
                 "get_world_state_snapshot",
                 "get_addon_info",
                 "create_blend_snapshot",
+                "create_blend_snapshot_explicit_roots",
+                "discover_scene_asset_roots",
                 "get_object_info",
                 "get_viewport_screenshot",
                 "execute_code",
@@ -1002,6 +1007,415 @@ class BlenderMCPServer:
         return datablocks
 
     @staticmethod
+    def _scene_asset_geometry_fingerprint(obj):
+        data = getattr(obj, "data", None)
+        if data is None:
+            return None
+        digest = hashlib.sha256()
+        has_content = False
+
+        def update_numeric_collection(collection, attribute, typecode, width):
+            nonlocal has_content
+            if collection is None:
+                return
+            try:
+                count = len(collection)
+            except Exception:
+                return
+            if count <= 0:
+                return
+            foreach_get = getattr(collection, "foreach_get", None)
+            if callable(foreach_get):
+                values = array.array(typecode, [0]) * (count * width)
+                foreach_get(attribute, values)
+                digest.update(values.tobytes())
+                has_content = True
+                return
+            for element in collection:
+                value = getattr(element, attribute, None)
+                if value is None:
+                    continue
+                if isinstance(value, (str, bytes)) or not hasattr(value, "__iter__"):
+                    values = (value,)
+                else:
+                    values = value
+                for component in values:
+                    if typecode == "f":
+                        digest.update(struct.pack("<d", float(component)))
+                    else:
+                        digest.update(struct.pack("<q", int(component)))
+                has_content = True
+
+        update_numeric_collection(getattr(data, "vertices", None), "co", "f", 3)
+        update_numeric_collection(getattr(data, "edges", None), "vertices", "i", 2)
+        update_numeric_collection(getattr(data, "loops", None), "vertex_index", "i", 1)
+        update_numeric_collection(getattr(data, "polygons", None), "loop_start", "i", 1)
+        update_numeric_collection(getattr(data, "polygons", None), "loop_total", "i", 1)
+
+        for spline in getattr(data, "splines", ()) or ():
+            digest.update(str(getattr(spline, "type", "")).encode("utf-8"))
+            update_numeric_collection(getattr(spline, "points", None), "co", "f", 4)
+            update_numeric_collection(getattr(spline, "bezier_points", None), "co", "f", 3)
+            update_numeric_collection(getattr(spline, "bezier_points", None), "handle_left", "f", 3)
+            update_numeric_collection(getattr(spline, "bezier_points", None), "handle_right", "f", 3)
+
+        for bone in sorted(getattr(data, "bones", ()) or (), key=lambda value: value.name):
+            digest.update(bone.name.encode("utf-8"))
+            digest.update(str(getattr(getattr(bone, "parent", None), "name", "")).encode("utf-8"))
+            for attribute in ("head_local", "tail_local"):
+                vector = getattr(bone, attribute, None)
+                if vector is not None:
+                    for component in vector:
+                        digest.update(struct.pack("<d", float(component)))
+                    has_content = True
+
+        body = getattr(data, "body", None)
+        if isinstance(body, str):
+            digest.update(body.encode("utf-8"))
+            has_content = has_content or bool(body)
+
+        return digest.hexdigest() if has_content else None
+
+    @staticmethod
+    def _scene_asset_dependency_names(obj):
+        names = set()
+        dependency_attrs = (
+            "object",
+            "target",
+            "pole_target",
+            "mirror_object",
+            "offset_object",
+            "origin",
+            "start_cap",
+            "end_cap",
+        )
+        for modifier in getattr(obj, "modifiers", ()) or ():
+            for attribute in dependency_attrs:
+                target = getattr(modifier, attribute, None)
+                name = getattr(target, "name", None)
+                if isinstance(name, str):
+                    names.add(name)
+        for constraint in getattr(obj, "constraints", ()) or ():
+            for attribute in ("target", "pole_target"):
+                target = getattr(constraint, attribute, None)
+                name = getattr(target, "name", None)
+                if isinstance(name, str):
+                    names.add(name)
+        pose = getattr(obj, "pose", None)
+        for bone in getattr(pose, "bones", ()) or ():
+            for constraint in getattr(bone, "constraints", ()) or ():
+                for attribute in ("target", "pole_target"):
+                    target = getattr(constraint, attribute, None)
+                    name = getattr(target, "name", None)
+                    if isinstance(name, str):
+                        names.add(name)
+        find_armature = getattr(obj, "find_armature", None)
+        if callable(find_armature):
+            try:
+                target = find_armature()
+            except Exception:
+                target = None
+            name = getattr(target, "name", None)
+            if isinstance(name, str):
+                names.add(name)
+        return sorted(names)
+
+    @staticmethod
+    def _scene_asset_signature_value(value):
+        if value is None or isinstance(value, (str, bool, int)):
+            return value
+        if isinstance(value, float):
+            return value.hex()
+        name = getattr(value, "name_full", None) or getattr(value, "name", None)
+        if isinstance(name, str):
+            return {"type": type(value).__name__, "name": name}
+        if isinstance(value, (tuple, list, array.array)):
+            return [
+                BlenderMCPServer._scene_asset_signature_value(item)
+                for item in value
+            ]
+        if not isinstance(value, (str, bytes)):
+            try:
+                return [
+                    BlenderMCPServer._scene_asset_signature_value(item)
+                    for item in value
+                ]
+            except (TypeError, ValueError):
+                pass
+        return type(value).__name__
+
+    @staticmethod
+    def _scene_asset_rna_signature(value):
+        result = {}
+        properties = getattr(getattr(value, "bl_rna", None), "properties", None)
+        if properties is not None:
+            for prop in properties:
+                identifier = getattr(prop, "identifier", None)
+                if (
+                    not isinstance(identifier, str)
+                    or identifier in {"rna_type", "show_expanded", "is_active", "is_override_data"}
+                ):
+                    continue
+                prop_type = getattr(prop, "type", None)
+                if prop_type not in {"BOOLEAN", "INT", "FLOAT", "STRING", "ENUM", "POINTER"}:
+                    continue
+                try:
+                    raw_value = getattr(value, identifier)
+                except Exception:
+                    continue
+                result[identifier] = BlenderMCPServer._scene_asset_signature_value(raw_value)
+            return result
+
+        try:
+            attributes = vars(value).items()
+        except TypeError:
+            return result
+        for identifier, raw_value in sorted(attributes):
+            if identifier.startswith("_") or identifier in {"rna_type", "bl_rna"}:
+                continue
+            result[identifier] = BlenderMCPServer._scene_asset_signature_value(raw_value)
+        return result
+
+    @staticmethod
+    def _scene_asset_data_summary(obj):
+        data = getattr(obj, "data", None)
+        if data is None:
+            return {}
+        counts = {}
+        for attribute in ("vertices", "edges", "polygons", "splines", "bones", "points"):
+            value = getattr(data, attribute, None)
+            if value is None:
+                continue
+            try:
+                counts[attribute] = len(value)
+            except Exception:
+                continue
+        materials = getattr(data, "materials", ()) or ()
+        return {
+            "dataName": getattr(data, "name", None),
+            "dataType": type(data).__name__,
+            "dataCounts": counts,
+            "geometryFingerprint": BlenderMCPServer._scene_asset_geometry_fingerprint(obj),
+            "materialNames": sorted(
+                material.name
+                for material in materials
+                if isinstance(getattr(material, "name", None), str)
+            ),
+        }
+
+    def _scene_asset_fingerprint(self, scene_objects):
+        scene = bpy.context.scene
+        records = []
+        for obj in sorted(scene_objects, key=lambda value: value.name):
+            parent = getattr(obj, "parent", None)
+            collections = sorted(
+                collection.name
+                for collection in (getattr(obj, "users_collection", ()) or ())
+                if isinstance(getattr(collection, "name", None), str)
+            )
+            children = sorted(
+                child.name
+                for child in (getattr(obj, "children", ()) or ())
+                if isinstance(getattr(child, "name", None), str)
+            )
+            records.append(
+                {
+                    "name": obj.name,
+                    "type": getattr(obj, "type", None),
+                    "parentName": getattr(parent, "name", None),
+                    "children": children,
+                    "collections": collections,
+                    "location": self._snapshot_vector(getattr(obj, "location", None)),
+                    "rotation": self._snapshot_vector(getattr(obj, "rotation_euler", None)),
+                    "scale": self._snapshot_vector(getattr(obj, "scale", None)),
+                    "dimensions": self._snapshot_vector(getattr(obj, "dimensions", None)),
+                    "data": self._scene_asset_data_summary(obj),
+                    "modifiers": [
+                        self._scene_asset_rna_signature(modifier)
+                        for modifier in (getattr(obj, "modifiers", ()) or ())
+                    ],
+                    "constraints": [
+                        self._scene_asset_rna_signature(constraint)
+                        for constraint in (getattr(obj, "constraints", ()) or ())
+                    ],
+                    "poseConstraints": [
+                        {
+                            "boneName": getattr(bone, "name", None),
+                            "constraints": [
+                                self._scene_asset_rna_signature(constraint)
+                                for constraint in (getattr(bone, "constraints", ()) or ())
+                            ],
+                        }
+                        for bone in (getattr(getattr(obj, "pose", None), "bones", ()) or ())
+                    ],
+                    "dependencyNames": self._scene_asset_dependency_names(obj),
+                }
+            )
+        payload = {
+            "sourceBlendPath": getattr(bpy.data, "filepath", "") or None,
+            "sceneName": getattr(scene, "name", None),
+            "objects": records,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    def _scene_object_is_parent_ancestor(self, ancestor_key, obj):
+        parent = getattr(obj, "parent", None)
+        visited = set()
+        while parent is not None:
+            parent_key = self._snapshot_id_key(parent)
+            if parent_key == ancestor_key:
+                return True
+            if parent_key in visited:
+                return False
+            visited.add(parent_key)
+            parent = getattr(parent, "parent", None)
+        return False
+
+    @staticmethod
+    def _scene_asset_object_id(scene_fingerprint, obj):
+        value = json.dumps(
+            [scene_fingerprint, obj.name, getattr(obj, "type", None)],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        return "obj_" + hashlib.sha256(value.encode("utf-8")).hexdigest()[:24]
+
+    def discover_scene_asset_roots(self):
+        """Read-only inventory of top-level asset-root candidates in the active scene.
+
+        Object IDs are scoped to sceneFingerprint. They are not Blender datablock
+        pointers and must be rediscovered whenever the scene fingerprint changes.
+        A root plus its parented descendants is one candidate; independent roots
+        can be grouped into one logical asset by the caller when appropriate.
+        """
+        scene = bpy.context.scene
+        scene_objects = list(getattr(scene, "objects", ()) or ())
+        scene_keys = {self._snapshot_id_key(obj) for obj in scene_objects}
+        dependency_keys = set()
+        dependency_attrs = (
+            "object",
+            "target",
+            "mirror_object",
+            "offset_object",
+            "origin",
+            "start_cap",
+            "end_cap",
+        )
+
+        for obj in scene_objects:
+            for modifier in getattr(obj, "modifiers", ()) or ():
+                for attribute in dependency_attrs:
+                    target = getattr(modifier, attribute, None)
+                    key = self._snapshot_id_key(target)
+                    if key in scene_keys and key != self._snapshot_id_key(obj) and not self._scene_object_is_parent_ancestor(key, obj):
+                        dependency_keys.add(key)
+            for constraint in getattr(obj, "constraints", ()) or ():
+                for attribute in ("target", "pole_target"):
+                    target = getattr(constraint, attribute, None)
+                    key = self._snapshot_id_key(target)
+                    if key in scene_keys and key != self._snapshot_id_key(obj) and not self._scene_object_is_parent_ancestor(key, obj):
+                        dependency_keys.add(key)
+            pose = getattr(obj, "pose", None)
+            for bone in getattr(pose, "bones", ()) or ():
+                for constraint in getattr(bone, "constraints", ()) or ():
+                    for attribute in ("target", "pole_target"):
+                        target = getattr(constraint, attribute, None)
+                        key = self._snapshot_id_key(target)
+                        if key in scene_keys and key != self._snapshot_id_key(obj) and not self._scene_object_is_parent_ancestor(key, obj):
+                            dependency_keys.add(key)
+            find_armature = getattr(obj, "find_armature", None)
+            if callable(find_armature):
+                try:
+                    target = find_armature()
+                except Exception:
+                    target = None
+                key = self._snapshot_id_key(target)
+                if key in scene_keys and key != self._snapshot_id_key(obj) and not self._scene_object_is_parent_ancestor(key, obj):
+                    dependency_keys.add(key)
+
+        scene_fingerprint = self._scene_asset_fingerprint(scene_objects)
+        geometry_types = {
+            "MESH",
+            "CURVE",
+            "SURFACE",
+            "FONT",
+            "META",
+            "VOLUME",
+            "GREASEPENCIL",
+        }
+        asset_types = geometry_types | {"ARMATURE"}
+        excluded_types = {"CAMERA", "LIGHT", "SPEAKER", "LIGHT_PROBE"}
+        roots = []
+
+        for obj in sorted(scene_objects, key=lambda value: value.name):
+            obj_key = self._snapshot_id_key(obj)
+            parent_key = self._snapshot_id_key(getattr(obj, "parent", None))
+            if parent_key in scene_keys or obj_key in dependency_keys:
+                continue
+            if getattr(obj, "type", None) in excluded_types:
+                continue
+
+            descendants = []
+            descendant_keys = set()
+            pending = list(getattr(obj, "children", ()) or ())
+            while pending:
+                child = pending.pop()
+                child_key = self._snapshot_id_key(child)
+                if child_key not in scene_keys or child_key in descendant_keys:
+                    continue
+                descendant_keys.add(child_key)
+                descendants.append(child)
+                pending.extend(list(getattr(child, "children", ()) or ()))
+
+            members = [obj, *descendants]
+            asset_members = [
+                member
+                for member in members
+                if getattr(member, "type", None) in asset_types
+            ]
+            if not asset_members:
+                continue
+
+            collection_names = sorted(
+                {
+                    collection.name
+                    for member in members
+                    for collection in (getattr(member, "users_collection", ()) or ())
+                    if isinstance(getattr(collection, "name", None), str)
+                }
+            )
+            roots.append(
+                {
+                    "rootObjectId": self._scene_asset_object_id(scene_fingerprint, obj),
+                    "objectName": obj.name,
+                    "objectType": getattr(obj, "type", "UNKNOWN"),
+                    "dataName": getattr(getattr(obj, "data", None), "name", None),
+                    "collectionNames": collection_names,
+                    "descendantObjectIds": sorted(
+                        self._scene_asset_object_id(scene_fingerprint, child)
+                        for child in descendants
+                    ),
+                    "descendantObjectNames": sorted(child.name for child in descendants),
+                    "objectCount": len(members),
+                    "geometryObjectCount": sum(
+                        1 for member in members
+                        if getattr(member, "type", None) in geometry_types
+                    ),
+                }
+            )
+
+        return {
+            "sceneFingerprint": scene_fingerprint,
+            "sceneName": getattr(scene, "name", None),
+            "sourceBlendPath": getattr(bpy.data, "filepath", "") or None,
+            "blenderVersion": getattr(bpy.app, "version_string", None),
+            "sceneObjectCount": len(scene_objects),
+            "roots": roots,
+        }
+
+    @staticmethod
     def _snapshot_vector(value):
         if value is None:
             return ()
@@ -1063,19 +1477,74 @@ class BlenderMCPServer:
         filepath,
         selectionMode="CURRENT_SELECTION",
         closureMode="ASSET_CLOSURE",
+        rootObjectNames=None,
+        expectedSceneFingerprint=None,
     ):
-        """Write the current selected asset closure to a standalone .blend file."""
-        if selectionMode != "CURRENT_SELECTION":
-            raise ValueError("selectionMode must be CURRENT_SELECTION")
+        """Write one isolated asset closure without mutating the active Blender scene.
+
+        CURRENT_SELECTION snapshots all selected objects as ONE logical asset.
+        EXPLICIT_ROOTS snapshots only the named top-level root objects and their
+        ASSET_CLOSURE dependencies. Explicit roots require a fresh sceneFingerprint
+        returned by discover_scene_asset_roots.
+        """
+        if selectionMode not in {"CURRENT_SELECTION", "EXPLICIT_ROOTS"}:
+            raise ValueError("selectionMode must be CURRENT_SELECTION or EXPLICIT_ROOTS")
         if not filepath or not isinstance(filepath, str):
             raise ValueError("filepath must be a non-empty string")
         target = os.path.abspath(os.path.expanduser(filepath))
         if not target.lower().endswith(".blend"):
             raise ValueError("snapshot filepath must end with .blend")
 
-        selected = list(bpy.context.selected_objects)
+        source_scene_fingerprint = None
+        if selectionMode == "CURRENT_SELECTION":
+            if rootObjectNames is not None or expectedSceneFingerprint is not None:
+                raise ValueError(
+                    "CURRENT_SELECTION does not accept rootObjectNames or expectedSceneFingerprint"
+                )
+            selected = list(bpy.context.selected_objects)
+            if not selected:
+                raise ValueError("CURRENT_SELECTION requires at least one selected object")
+        else:
+            if (
+                not isinstance(rootObjectNames, list)
+                or not rootObjectNames
+                or len(rootObjectNames) > 64
+                or any(not isinstance(name, str) or not name.strip() for name in rootObjectNames)
+            ):
+                raise ValueError("EXPLICIT_ROOTS requires 1-64 non-empty rootObjectNames")
+            if len(set(rootObjectNames)) != len(rootObjectNames):
+                raise ValueError("EXPLICIT_ROOTS rootObjectNames must be unique")
+            if (
+                not isinstance(expectedSceneFingerprint, str)
+                or len(expectedSceneFingerprint) != 64
+                or any(char not in "0123456789abcdef" for char in expectedSceneFingerprint.lower())
+            ):
+                raise ValueError("EXPLICIT_ROOTS requires a SHA-256 expectedSceneFingerprint")
+
+            discovery = self.discover_scene_asset_roots()
+            source_scene_fingerprint = discovery["sceneFingerprint"]
+            if source_scene_fingerprint != expectedSceneFingerprint.lower():
+                raise ValueError(
+                    "SCENE_CHANGED: rediscover scene asset roots before preparing snapshots"
+                )
+            root_by_name = {
+                item["objectName"]: item
+                for item in discovery["roots"]
+            }
+            missing_roots = sorted(set(rootObjectNames) - set(root_by_name))
+            if missing_roots:
+                raise ValueError(
+                    "EXPLICIT_ROOT_NOT_FOUND: rootObjectNames are not current scene asset roots: "
+                    + ", ".join(missing_roots)
+                )
+            objects_by_name = {
+                obj.name: obj
+                for obj in list(getattr(bpy.context.scene, "objects", ()) or ())
+            }
+            selected = [objects_by_name[name] for name in rootObjectNames]
+
         if not selected:
-            raise ValueError("CURRENT_SELECTION requires at least one selected object")
+            raise ValueError("snapshot requires at least one root object")
 
         before = self._capture_snapshot_guard_state()
         included_objects = self._collect_snapshot_objects(selected, closureMode)
@@ -1112,7 +1581,7 @@ class BlenderMCPServer:
             raise
 
         included_names = sorted(obj.name for obj in included_objects)
-        return {
+        result = {
             "filepath": target,
             "rootObjectNames": sorted(root_names),
             "includedObjectNames": included_names,
@@ -1122,6 +1591,9 @@ class BlenderMCPServer:
                 before["filepath"], root_names, included_objects
             ),
         }
+        if source_scene_fingerprint is not None:
+            result["sourceSceneFingerprint"] = source_scene_fingerprint
+        return result
 
     def get_scene_info(self):
         """Get information about the current Blender scene"""
