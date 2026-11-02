@@ -780,10 +780,12 @@ async def prepare_blend_asset(
     profile: str,
     overrides: Dict[str, Any] | None = None,
 ) -> CallToolResult:
-    """Prepare one .blend or the current Blender selection in an isolated worker.
+    """Prepare exactly one logical asset from one .blend or current selection.
 
     BLEND_FILE never touches the GUI socket. CURRENT_SELECTION performs one
-    ASSET_CLOSURE snapshot handoff, then uses the same background pipeline.
+    ASSET_CLOSURE snapshot handoff of all selected objects and their dependencies,
+    producing ONE prepared asset. It does not split independent selected roots into
+    separate assets. Use only when the selection as a whole is one logical model.
     The result carries structured observation/artifact data plus the MAIN image.
     """
     try:
@@ -1292,7 +1294,10 @@ def _batch_prepare_page_content(page: Dict[str, Any]) -> CallToolResult:
 
 @mcp.tool()
 def discover_blend_files(directory: str) -> CallToolResult:
-    """Discover local .blend files and return a deterministic fingerprinted manifest."""
+    """Discover only local .blend files and return a fingerprinted file manifest.
+
+    This does not enumerate objects or Collections in the currently open Blender scene.
+    """
 
     try:
         items = discover_local_blend_files(directory)
@@ -1317,7 +1322,12 @@ async def start_prepare_blend_assets(
     concurrency: int | None = None,
     overrides: Dict[str, Any] | None = None,
 ) -> CallToolResult:
-    """Start or retry an asynchronous local batch prepare job."""
+    """Start or retry an asynchronous file-based batch prepare job.
+
+    Every item must identify a separate on-disk .blend file with a valid path and
+    sourceFingerprint. This tool does not accept current-scene objects, object names,
+    selections, or Collection names as batch items.
+    """
 
     try:
         _validate_prepare_overrides(overrides)
